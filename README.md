@@ -116,6 +116,7 @@ A few design choices are deliberate and worth copying into future examples:
   registered in it.
 - A **CDF Public Cloud** environment with at least one running NiFi deployment, and
   that deployment's **CRN**.
+
 Then, depending on which layer you're monitoring:
 
 - **Control plane examples** — a **CDP API access key pair** (`access key id` +
@@ -123,8 +124,13 @@ Then, depending on which layer you're monitoring:
   deployments.
 - **NiFi API examples** — **CDP workload credentials** (workload username + workload
   password) for a user with access to the NiFi deployment, plus the deployment's NiFi
-  base URL. The workload password must be set explicitly (it is not the same as your
-  CDP console password), and the user needs to be able to view the flow in NiFi.
+  base URL. The workload password must be set explicitly via
+  `cdp iam set-workload-password` (it is not your CDP console password), and the user
+  needs a DataFlow role that permits viewing the deployment in NiFi — `DFFlowUser` for
+  read-only, `DFFlowAdmin` for full privileges.
+  **See the [authentication caveat](#authentication-here-is-an-unresolved-question)
+  before relying on this** — programmatic access to `/nifi-api` through the DFX gateway
+  is not a documented mechanism.
 
 ---
 
@@ -347,6 +353,57 @@ python tool.py \
   --tool-params '{"process_group_id":"root"}'
 ```
 
+#### Authentication here is an unresolved question
+
+> ⚠️ **The auth mechanism this tool uses is not documented by Cloudera.** It is the most
+plausible approach, not a confirmed one, and it may not work in your environment. Being
+straight about this matters more than the template looking finished.
+
+What the documentation actually says:
+
+- Cloudera documents **interactive SSO** for reaching a deployment's NiFi UI, using
+  Cloudera SSO credentials — [viewing a deployment in NiFi](https://docs.cloudera.com/dataflow/cloud/managing-deployments/topics/cdf-viewing-dataflow-in-nifi.html).
+- The workload password is documented for "non-UI workload interfaces" generally, while
+  NiFi is specifically listed as an **SSO-based** interface —
+  [workload password](https://docs.cloudera.com/management-console/cloud/user-management/topics/mc-setting-the-ipa-password.html),
+  [non-SSO interfaces](https://docs.cloudera.com/management-console/cloud/user-management/topics/mc-accessing-non-sso-interfaces-using-ipa-credentials.html).
+- The **only** officially documented HTTP Basic auth path through the DFX gateway is the
+  **Prometheus metrics endpoint**, and it uses a dedicated generated `nifi-metrics`
+  credential rather than a user's workload password —
+  [accessing NiFi metrics](https://docs.cloudera.com/dataflow/cloud/manage-environment/topics/cdf-access-nifi-metrics.html).
+- For Knox-fronted NiFi generally, Cloudera community guidance warns that a NiFi bearer
+  token "would not work as Knox does not recognize this token… the URL always redirects
+  to the SSO URL" —
+  [community article](https://community.cloudera.com/t5/Community-Articles/How-to-access-NiFi-Rest-API-through-SSO-enabled-Knox-Proxy/ta-p/298863).
+
+No documentation was found describing a supported way to call general `/nifi-api`
+endpoints programmatically through the DFX gateway.
+
+**So the tool is built to fail legibly.** It does not follow redirects, because a gateway
+that bounces the request to SSO would otherwise return an HTML login page with a `200`
+status — which looks like a parsing bug rather than an auth refusal. Instead you get:
+
+```json
+{
+  "error": "The gateway redirected the request instead of serving the NiFi API, which indicates it requires interactive SSO rather than HTTP Basic authentication.",
+  "status_code": 302,
+  "redirected_to": "https://.../gateway/knoxsso/api/v1/websso?originalUrl=...",
+  "hint": "HTTP Basic authentication with CDP workload credentials is not an access method Cloudera documents for /nifi-api through the DFX gateway. ..."
+}
+```
+
+A `302` means the mechanism is wrong and no credential fix will help. A persistent `401`
+may mean the same thing. Either way, the documented fallbacks are:
+
+| Alternative | Trade-off |
+| --- | --- |
+| **Prometheus metrics endpoint** (`/federate`) with the generated `nifi-metrics` credential | Officially documented and supported for programmatic access. Returns Prometheus metrics, not NiFi API JSON, so the tool would need to parse a different format — but it gives real flow-level numbers. |
+| **`cdp iam generate-workload-auth-token --workload-name DF`** as a bearer token | A real, documented CDP CLI command, but the token appears scoped to the DataFlow *workload control-plane* API rather than the embedded NiFi. Unconfirmed against `/nifi-api` — empirically testable. |
+| **Stay on the control plane** ([example 1](#1-nifi-monitoring-agents)) | Fully supported, but cannot see inside the flow. |
+
+If you confirm what actually works in your environment, that result belongs in this
+section.
+
 ---
 
 ## Credentials and safety
@@ -370,7 +427,14 @@ python tool.py \
 
 - **Chaining the two layers** — one workflow that takes a deployment CRN, resolves its
   NiFi URL from the control plane, then inspects the canvas, so a single run covers both
-  layers without hand-configuring a base URL.
+  layers without hand-configuring a base URL. This is already feasible:
+  `df describe-deployment` returns `nifiUrl`, `dfxLocalUrl`, and `cfmNifiVersion`
+  (confirmed in Cloudera's published
+  [CDP CLI model](https://raw.githubusercontent.com/cloudera/cdpcli/master/cdpcli/data/df/df.yaml)),
+  so example 1's tool already has the base URL example 2 needs.
+- **A Prometheus-metrics tool** — using the documented `/federate` endpoint and the
+  `nifi-metrics` credential, which may be the supported route to flow-level numbers if
+  direct `/nifi-api` access proves unavailable.
 - **Provenance and deeper flow inspection** — provenance queries and per-connection
   back-pressure analysis, beyond the status summaries used today.
 - **Fleet sweeps** — inspect every deployment in an environment and summarize the

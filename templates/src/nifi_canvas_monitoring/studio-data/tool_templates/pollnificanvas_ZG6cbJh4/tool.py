@@ -18,12 +18,31 @@ Endpoints used (stable across NiFi 1.x and 2.x):
     GET /nifi-api/flow/process-groups/{id}/status   process group status
     GET /nifi-api/flow/bulletin-board               active warnings/errors
 
-Authentication is HTTP Basic against the DFX gateway, using CDP
-workload credentials supplied through Agent Studio tool configuration:
+Authentication is attempted as HTTP Basic against the DFX gateway,
+using CDP workload credentials supplied through Agent Studio tool
+configuration:
 
     NIFI_BASE_URL
     NIFI_USERNAME
     NIFI_PASSWORD
+
+IMPORTANT, UNVERIFIED MECHANISM:
+
+Cloudera documents interactive SSO for reaching the NiFi UI of a
+CDF Public Cloud deployment, and documents HTTP Basic authentication
+over the DFX gateway only for the Prometheus metrics endpoint, which
+uses a dedicated `nifi-metrics` credential rather than a user's
+workload password. No Cloudera documentation was found describing a
+supported way to call general `/nifi-api` endpoints programmatically
+through the gateway.
+
+This tool therefore attempts the most plausible mechanism, and is
+written so that an unsupported one fails legibly: a gateway redirect
+to SSO is reported as such rather than followed into an HTML login
+page, and the 401 path says that the mechanism itself may be
+unsupported. If this approach does not work in your environment, the
+documented alternatives are the Prometheus metrics endpoint or the
+Cloudera DataFlow control plane API.
 
 The agent only needs to provide:
 
@@ -152,10 +171,16 @@ def get_json(
 
     try:
 
+        # Redirects are not followed. A Knox-style gateway answers an
+        # unsupported API login by redirecting to its SSO endpoint, and
+        # following that chain yields an HTML login page with a 200
+        # status, which is far harder to diagnose than the redirect
+        # itself.
         response = session.get(
             url,
             params=params,
             timeout=REQUEST_TIMEOUT_SECONDS,
+            allow_redirects=False,
         )
 
     except requests.exceptions.SSLError as exc:
@@ -196,6 +221,41 @@ def get_json(
         }
 
     # -----------------------------------------------------------------
+    # Gateway redirect, which in practice means SSO.
+    #
+    # Cloudera documents browser SSO for the NiFi UI and does not
+    # document a general programmatic auth mechanism for /nifi-api
+    # through the DFX gateway. If the gateway bounces this request to
+    # an SSO endpoint, HTTP Basic authentication is not accepted here
+    # and no credential fix will help — the access method itself has
+    # to change. That is worth saying plainly.
+    # -----------------------------------------------------------------
+
+    if 300 <= response.status_code < 400:
+
+        location = response.headers.get("Location", "")
+
+        return {
+            "error": (
+                "The gateway redirected the request instead of serving "
+                "the NiFi API, which indicates it requires interactive "
+                "SSO rather than HTTP Basic authentication."
+            ),
+            "url": url,
+            "status_code": response.status_code,
+            "redirected_to": location,
+            "hint": (
+                "HTTP Basic authentication with CDP workload "
+                "credentials is not an access method Cloudera "
+                "documents for /nifi-api through the DFX gateway. "
+                "Documented alternatives are the Prometheus metrics "
+                "endpoint, which uses a dedicated nifi-metrics "
+                "credential, or the Cloudera DataFlow control plane "
+                "API. See the repository README."
+            ),
+        }
+
+    # -----------------------------------------------------------------
     # Authentication and authorization failures.
     #
     # These are the most common setup problems, so they are reported
@@ -215,7 +275,13 @@ def get_json(
                 "Confirm the CDP workload username and workload "
                 "password are correct, that a workload password has "
                 "been set for the user, and that the user has been "
-                "granted access to this NiFi deployment."
+                "granted a DataFlow role that permits viewing this "
+                "deployment in NiFi. Note that HTTP Basic "
+                "authentication against /nifi-api through the DFX "
+                "gateway is not an access method Cloudera documents, "
+                "so a persistent rejection here may mean the "
+                "mechanism is unsupported rather than the credentials "
+                "being wrong. See the repository README."
             ),
         }
 
