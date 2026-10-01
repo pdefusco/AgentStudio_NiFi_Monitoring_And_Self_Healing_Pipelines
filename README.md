@@ -47,12 +47,23 @@ If you know one half of this stack but not the other:
 | **Deployment CRN** | The Cloudera Resource Name identifying one CDF deployment, e.g. `crn:cdp:df:us-west-1:...`. The primary input to every example here. |
 | **CDP CLI (`cdpcli`)** | Cloudera's control-plane CLI, pip-installable and importable as a Python module. The tools here drive the Cloudera API through it. |
 
-### A note on scope: control plane, not `/nifi-api`
+### Two layers of monitoring
 
-The current example monitors at the **CDF control-plane** level — deployment status,
-size, version, configured KPIs — via the Cloudera DataFlow API. It does *not* call
-NiFi's own `/nifi-api` endpoints, so it does not report processor-level state,
-bulletins, or provenance. Flow-internal inspection is on the [roadmap](#roadmap).
+There are two distinct places to ask "is this flow healthy", and this repo has an
+example of each:
+
+| | **Control plane** | **NiFi canvas** |
+| --- | --- | --- |
+| API | Cloudera DataFlow (CDP) | NiFi REST API (`/nifi-api`) |
+| Answers | Is the *deployment* up? What size, version, KPIs? | What is happening *inside the flow*? |
+| Sees | Deployment status, sizing, NiFi version, configured KPIs | Processor run states, queue depths, throughput, bulletins |
+| Auth | CDP API access key pair | CDP workload credentials via the DFX gateway |
+| Example | [1. NiFi Monitoring Agents](#1-nifi-monitoring-agents) | [2. NiFi Canvas Monitoring Agents](#2-nifi-canvas-monitoring-agents) |
+
+The distinction matters: **a deployment can be perfectly healthy at the control-plane
+level while the flow inside it is broken** — processors invalid or stopped, queues
+backing up, components throwing errors. The control plane says `RUNNING`; only the
+NiFi API tells you the flow stopped doing useful work.
 
 ---
 
@@ -105,8 +116,15 @@ A few design choices are deliberate and worth copying into future examples:
   registered in it.
 - A **CDF Public Cloud** environment with at least one running NiFi deployment, and
   that deployment's **CRN**.
-- A **CDP API access key pair** (`access key id` + `private key`) for a user or machine
-  user with permission to read DataFlow deployments.
+Then, depending on which layer you're monitoring:
+
+- **Control plane examples** — a **CDP API access key pair** (`access key id` +
+  `private key`) for a user or machine user with permission to read DataFlow
+  deployments.
+- **NiFi API examples** — **CDP workload credentials** (workload username + workload
+  password) for a user with access to the NiFi deployment, plus the deployment's NiFi
+  base URL. The workload password must be set explicitly (it is not the same as your
+  CDP console password), and the user needs to be able to view the flow in NiFi.
 
 ---
 
@@ -153,7 +171,15 @@ doesn't, the problem is in the workflow wiring, not in the Cloudera API call.
 .
 ├── README.md
 └── templates/
-    └── workflow_template_13nuodia.zip     # exported Agent Studio workflow template
+    ├── workflow_template_13nuodia.zip      # importable: NiFi Monitoring Agents
+    ├── workflow_template_gvie9za2.zip      # importable: NiFi Canvas Monitoring Agents
+    └── src/                                # unpacked sources, for review and rebuilds
+        ├── build_template.py               # packs a source dir into an importable .zip
+        └── nifi_canvas_monitoring/
+            ├── workflow_template.json
+            └── studio-data/tool_templates/pollnificanvas_ZG6cbJh4/
+                ├── tool.py
+                └── requirements.txt
 ```
 
 Each template `.zip` has the Agent Studio export structure:
@@ -171,6 +197,21 @@ studio-data/
 backstory, task description, and expected output live. Worth reading before importing
 anyone's template, including these.
 
+**Why both a zip and an unpacked copy?** A zip is what Agent Studio imports, but it is
+opaque in git — you cannot diff or code-review a tool whose source only exists inside an
+archive. So newer templates keep their sources unpacked under `templates/src/` and are
+packed on demand:
+
+```bash
+python templates/src/build_template.py nifi_canvas_monitoring \
+  --output templates/workflow_template_gvie9za2.zip
+```
+
+`build_template.py` validates the manifest before writing — that it parses, that
+workflow/agent/task/tool cross-references resolve, and that every tool's declared source
+folder and files exist — so a broken bundle fails at build time rather than at import
+time.
+
 ---
 
 ## Examples
@@ -178,6 +219,7 @@ anyone's template, including these.
 | Template | Workflow | What it demonstrates |
 | --- | --- | --- |
 | [`workflow_template_13nuodia.zip`](templates/workflow_template_13nuodia.zip) | **NiFi Monitoring Agents** | Read-only inspection of a CDF deployment's live status via the Cloudera DataFlow API |
+| [`workflow_template_gvie9za2.zip`](templates/workflow_template_gvie9za2.zip) | **NiFi Canvas Monitoring Agents** | Read-only inspection of the NiFi canvas itself — component states, queues, throughput, bulletins — via the NiFi REST API |
 
 ### 1. NiFi Monitoring Agents
 
@@ -225,6 +267,86 @@ Error returns — each one also echoes `deployment_crn`:
 | Request exceeded the 60s timeout | — |
 | Any other exception | `error_type` |
 
+### 2. NiFi Canvas Monitoring Agents
+
+The same question as example 1 — "what is the state of this flow" — asked one layer
+down, against the NiFi REST API of the deployment instead of the Cloudera DataFlow
+control plane. Also read-only.
+
+Built against **NiFi 2.x** (developed for Cloudera runtime `2.6.0.4.12.0.1-9`), using
+only status endpoints that are stable across NiFi 1.x and 2.x.
+
+**Agent — "NiFi Canvas Monitoring Agent"**
+Role: *Apache NiFi Flow Health Monitor*. Temperature `0.1`, no delegation. Instructed to
+call `pollNifiCanvas` before answering, to distinguish running / stopped / invalid /
+disabled components, and to treat invalid components, growing queues, and `ERROR`
+bulletins as health concerns worth calling out.
+
+**Task**
+Input: `process_group_id` — use `root` for the whole canvas, or a specific process group
+UUID to narrow the scope.
+Expected output — a *NiFi Flow Health Report* with the API request status, NiFi version,
+component counts, queue state, throughput, active bulletins, and a short health
+assessment citing the observed values that support it.
+
+**Tool — `pollNifiCanvas`**
+A venv tool (`pydantic`, `requests`) that makes up to four read-only `GET` requests with
+HTTP Basic auth through the DFX gateway, 30s timeout each:
+
+| Endpoint | Returned as | What it gives |
+| --- | --- | --- |
+| `/nifi-api/flow/about` | `about` | NiFi version, so the report states which NiFi answered |
+| `/nifi-api/flow/status` | `controller_status` | running / stopped / invalid / disabled tallies, active threads, total queued |
+| `/nifi-api/flow/process-groups/{id}/status?recursive=` | `process_group_status` | per-component states, queue depths, throughput |
+| `/nifi-api/flow/bulletin-board` | `bulletin_board` | active warnings and errors |
+
+| | |
+| --- | --- |
+| **User parameters** (from config) | `NIFI_BASE_URL`, `NIFI_USERNAME`, `NIFI_PASSWORD` |
+| **Tool parameters** (from the agent) | `process_group_id` (default `root`), `recursive` (default `true`), `include_bulletins` (default `true`) |
+| **On success** | Each section's raw NiFi API response, verbatim |
+
+`NIFI_BASE_URL` accepts the deployment URL with or without a trailing slash and with or
+without a trailing `/nifi-api`, so all of these work:
+
+```
+https://dfx.<env-id>.<region>.cloudera.site/<deployment-namespace>
+https://dfx.<env-id>.<region>.cloudera.site/<deployment-namespace>/
+https://dfx.<env-id>.<region>.cloudera.site/<deployment-namespace>/nifi-api
+```
+
+**Partial failure is a first-class outcome.** Each of the four sections is fetched
+independently, so one failing endpoint degrades that section rather than the whole call.
+Every response carries a `request_status` block:
+
+```json
+"request_status": {
+  "all_requests_succeeded": false,
+  "failed_sections": ["bulletin_board"]
+}
+```
+
+The agent is instructed to state explicitly when sections failed, so a partial report is
+never presented as a complete one. Per-section error returns:
+
+| Condition | Keys |
+| --- | --- |
+| `401` / `403` | `error`, `url`, `status_code`, `hint` about workload password setup |
+| `404` | `error`, `url`, `status_code`, `hint` about base URL and process group ID |
+| Other non-2xx | `error`, `url`, `status_code`, `raw_output` (truncated) |
+| Body wasn't JSON | `error`, `url`, `raw_output`, `hint` that an HTML body means a gateway login page |
+| TLS verification failed | `error`, `url`, `detail` |
+| Connect / read timeout | `error`, `url` |
+| Any other request error | `error`, `url`, `error_type`, `detail` |
+
+Standalone test:
+
+```bash
+python tool.py \
+  --user-params '{"NIFI_BASE_URL":"https://dfx.<env>.cloudera.site/<namespace>","NIFI_USERNAME":"<workload-user>","NIFI_PASSWORD":"<workload-password>"}' \
+  --tool-params '{"process_group_id":"root"}'
+```
+
 ---
 
 ## Credentials and safety
@@ -244,10 +366,13 @@ Error returns — each one also echoes `deployment_crn`:
 ## Roadmap
 
 > **Planned, not yet implemented.** The repo name describes where this is going; today
-> only the read-only monitoring example above exists.
+> only the read-only monitoring examples above exist.
 
-- **Flow-level NiFi monitoring** — processor state, bulletins, queue depths, and
-  provenance via NiFi's own API, beyond control-plane deployment status.
+- **Chaining the two layers** — one workflow that takes a deployment CRN, resolves its
+  NiFi URL from the control plane, then inspects the canvas, so a single run covers both
+  layers without hand-configuring a base URL.
+- **Provenance and deeper flow inspection** — provenance queries and per-connection
+  back-pressure analysis, beyond the status summaries used today.
 - **Fleet sweeps** — inspect every deployment in an environment and summarize the
   outliers, instead of one CRN at a time.
 - **Alerting and summarization** — turn a sweep into a digest or an alert on a
@@ -264,11 +389,23 @@ Error returns — each one also echoes `deployment_crn`:
 
 ## Adding a new example
 
-1. Build the workflow in Agent Studio — agents, tasks, and tools.
-2. Export it as a workflow template and drop the `.zip` into [`templates/`](templates/).
-3. Add a row to the [Examples](#examples) table and a short section describing the
-   agent, the task's inputs and expected output, and each tool's parameters and return
-   shape.
+Either direction works:
+
+**From Agent Studio** — build the workflow in the UI, export the template, drop the
+`.zip` into [`templates/`](templates/). Optionally unzip it under `templates/src/<name>/`
+so the tool code is reviewable.
+
+**From source** — copy an existing directory under `templates/src/`, edit
+`workflow_template.json` and the tool code, generate fresh UUIDs for the workflow, agents,
+tasks, and tools, then build and import:
+
+```bash
+python templates/src/build_template.py <name> --output templates/workflow_template_<id>.zip
+```
+
+Either way, add a row to the [Examples](#examples) table and a short section describing
+the agent, the task's inputs and expected output, and each tool's parameters and return
+shape.
 
 Conventions the existing template follows, worth keeping:
 
