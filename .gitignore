@@ -1,0 +1,19 @@
+# Credentials — never commit CDP keys
+.env
+.env.*
+!.env.example
+*.pem
+credentials
+cdp_credentials
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
