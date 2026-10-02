@@ -57,7 +57,7 @@ example of each:
 | API | Cloudera DataFlow (CDP) | NiFi REST API (`/nifi-api`) |
 | Answers | Is the *deployment* up? What size, version, KPIs? | What is happening *inside the flow*? |
 | Sees | Deployment status, sizing, NiFi version, configured KPIs | Processor run states, queue depths, throughput, bulletins |
-| Auth | CDP API access key pair | CDP workload credentials via the DFX gateway |
+| Auth | CDP API access key pair | CDP API access key pair, exchanged for a short-lived DataFlow workload token |
 | Example | [1. NiFi Monitoring Agents](#1-nifi-monitoring-agents) | [2. NiFi Canvas Monitoring Agents](#2-nifi-canvas-monitoring-agents) |
 
 The distinction matters: **a deployment can be perfectly healthy at the control-plane
@@ -117,20 +117,18 @@ A few design choices are deliberate and worth copying into future examples:
 - A **CDF Public Cloud** environment with at least one running NiFi deployment, and
   that deployment's **CRN**.
 
-Then, depending on which layer you're monitoring:
+Both examples need the same single credential: a **CDP API access key pair**
+(`access key id` + `private key`) for a user or machine user that can read DataFlow
+deployments. The NiFi API example exchanges it for a short-lived workload token rather
+than needing a second credential — see
+[how authentication was worked out](#how-authentication-was-worked-out).
 
-- **Control plane examples** — a **CDP API access key pair** (`access key id` +
-  `private key`) for a user or machine user with permission to read DataFlow
-  deployments.
-- **NiFi API examples** — **CDP workload credentials** (workload username + workload
-  password) for a user with access to the NiFi deployment, plus the deployment's NiFi
-  base URL. The workload password must be set explicitly via
-  `cdp iam set-workload-password` (it is not your CDP console password), and the user
-  needs a DataFlow role that permits viewing the deployment in NiFi — `DFFlowUser` for
-  read-only, `DFFlowAdmin` for full privileges.
-  **See the [authentication caveat](#authentication-here-is-an-unresolved-question)
-  before relying on this** — programmatic access to `/nifi-api` through the DFX gateway
-  is not a documented mechanism.
+The identity also needs a DataFlow role granting access to the deployment:
+`DFFlowUser` for read-only, `DFFlowAdmin` for full privileges.
+
+> **No workload password is involved.** If you have set one, it is not used here, and it
+> will not authenticate against `/nifi-api` — NiFi behind the DFX gateway has no
+> username/password login provider at all.
 
 ---
 
@@ -155,19 +153,51 @@ Then, depending on which layer you're monitoring:
    of the deployment you want inspected and run it. You should get back a Deployment
    Status Report grounded in the live API response.
 
-### Testing the tool on its own
+### Testing a tool on its own
 
-`tool.py` has a `__main__` entrypoint, so you can validate credentials and the CRN
-without going through an agent at all:
+Every `tool.py` has a `__main__` entrypoint, so you can validate credentials and
+connectivity without going through an agent at all. This is the fastest way to tell a
+credentials problem apart from a workflow-wiring problem.
+
+**Install the dependencies first.** Agent Studio builds each venv tool's virtualenv for
+you at import time, but running `tool.py` locally does not — so do it yourself once, or
+you will get `ModuleNotFoundError`:
 
 ```bash
-python tool.py \
+# from the repository root
+python3 -m venv .venv
+./.venv/bin/python -m pip install \
+  -r templates/src/<template>/studio-data/tool_templates/<tool>/requirements.txt
+```
+
+Use `./.venv/bin/python -m pip`, not `./.venv/bin/pip`. The `pip` wrapper hard-codes an
+interpreter path in its shebang, so if the venv is ever recreated against a different
+Python it will silently install into the wrong place — the install reports success and the
+import still fails. Going through `python -m pip` cannot drift.
+
+`cdpcli` is a large dependency and takes a few minutes to install; that is normal.
+
+Then run the tool with that interpreter:
+
+```bash
+./.venv/bin/python templates/src/<template>/studio-data/tool_templates/<tool>/tool.py \
+  --user-params '{...}' \
+  --tool-params '{...}'
+```
+
+For example 1 (`pollNifiFlow`), whose source lives only inside its `.zip`, unzip it
+somewhere first:
+
+```bash
+./.venv/bin/python tool.py \
   --user-params '{"CDP_ACCESS_KEY_ID":"<your-key-id>","CDP_PRIVATE_KEY":"<your-private-key>"}' \
   --tool-params '{"deployment_crn":"crn:cdp:df:<region>:<account>:deployment:<id>"}'
 ```
 
-It prints the tool's return value as indented JSON. If this works and the agent
-doesn't, the problem is in the workflow wiring, not in the Cloudera API call.
+It prints the tool's return value as indented JSON. If this works and the agent doesn't,
+the problem is in the workflow wiring, not in the Cloudera API call.
+
+`.venv/` is git-ignored.
 
 ---
 
@@ -273,6 +303,24 @@ Error returns — each one also echoes `deployment_crn`:
 | Request exceeded the 60s timeout | — |
 | Any other exception | `error_type` |
 
+> **Known issue: `-m cdpcli.clidriver` does not invoke the CLI.** With the `cdpcli`
+> version tested here (`0.9.164`), `cdpcli/clidriver.py` has no
+> `if __name__ == "__main__"` guard, so `python -m cdpcli.clidriver <command>` imports the
+> module, runs nothing, prints nothing, and **exits 0**. This tool would therefore always
+> land in its "exited cleanly but returned nothing" branch rather than ever reaching
+> Cloudera DataFlow.
+>
+> The working entry point is the one the installed `cdp` script uses:
+>
+> ```bash
+> python -c 'import sys; from cdpcli.clidriver import main; sys.exit(main())' \
+>   df describe-deployment --deployment-crn <crn> --output json
+> ```
+>
+> Verified: `-m` gives exit `0` with empty stdout and stderr; the `-c` form gives exit
+> `255` with the real `AUTHENTICATION_FAILURE` message on stderr. Example 2 uses the `-c`
+> form. Example 1's zip still has the `-m` form and needs the same fix.
+
 ### 2. NiFi Canvas Monitoring Agents
 
 The same question as example 1 — "what is the state of this flow" — asked one layer
@@ -289,15 +337,35 @@ disabled components, and to treat invalid components, growing queues, and `ERROR
 bulletins as health concerns worth calling out.
 
 **Task**
-Input: `process_group_id` — use `root` for the whole canvas, or a specific process group
-UUID to narrow the scope.
-Expected output — a *NiFi Flow Health Report* with the API request status, NiFi version,
-component counts, queue state, throughput, active bulletins, and a short health
-assessment citing the observed values that support it.
+Inputs: `deployment_crn` — the deployment whose canvas to inspect — and
+`process_group_id`, where `root` means the whole canvas and a specific process group UUID
+narrows the scope.
+Expected output — a *NiFi Flow Health Report* with the API request status, the
+deployment's control-plane status, NiFi version, component counts, queue state,
+throughput, active bulletins, and a short health assessment citing the observed values
+that support it. The agent is also told to call out when the control plane and the canvas
+disagree, and never to echo a credential or token.
 
 **Tool — `pollNifiCanvas`**
-A venv tool (`pydantic`, `requests`) that makes up to four read-only `GET` requests with
-HTTP Basic auth through the DFX gateway, 30s timeout each:
+A venv tool (`pydantic`, `requests`, `cdpcli`). It takes a deployment CRN and resolves
+everything else itself, which means this example **chains both monitoring layers in one
+call**:
+
+```
+1. df describe-deployment --deployment-crn <crn>
+      -> deployment.dfxLocalUrl                (the NiFi API base URL)
+      -> deployment.service.environmentCrn     (what the token is scoped to)
+      -> name, status, cfmNifiVersion, alert counts   (reported as context)
+
+2. iam generate-workload-auth-token --workload-name DF --environment-crn <env-crn>
+      -> token   (a short-lived signed JWT)
+
+3. GET <dfxLocalUrl>/nifi-api/...   with  Authorization: Bearer <token>
+```
+
+A token is minted per call and **never returned to the agent or logged** — only
+`token_obtained` and `expires_at` appear in the output. Then up to four read-only `GET`
+requests, 30s timeout each:
 
 | Endpoint | Returned as | What it gives |
 | --- | --- | --- |
@@ -308,12 +376,17 @@ HTTP Basic auth through the DFX gateway, 30s timeout each:
 
 | | |
 | --- | --- |
-| **User parameters** (from config) | `NIFI_BASE_URL`, `NIFI_USERNAME`, `NIFI_PASSWORD` |
-| **Tool parameters** (from the agent) | `process_group_id` (default `root`), `recursive` (default `true`), `include_bulletins` (default `true`) |
-| **On success** | Each section's raw NiFi API response, verbatim |
+| **User parameters** (from config) | `CDP_ACCESS_KEY_ID`, `CDP_PRIVATE_KEY`; optionally `NIFI_BASE_URL` and `DF_ENVIRONMENT_CRN` |
+| **Tool parameters** (from the agent) | `deployment_crn`, `process_group_id` (default `root`), `recursive` (default `true`), `include_bulletins` (default `true`) |
+| **On success** | Each section's raw NiFi API response, verbatim, plus a `deployment` context block |
 
-`NIFI_BASE_URL` accepts the deployment URL with or without a trailing slash and with or
-without a trailing `/nifi-api`, so all of these work:
+The same CDP API key pair as example 1 — no second credential to manage, and no workload
+password.
+
+`NIFI_BASE_URL` and `DF_ENVIRONMENT_CRN` are optional overrides that skip the
+`describe-deployment` lookup, for when the control plane reports a URL that isn't
+reachable from where the tool runs. `NIFI_BASE_URL` accepts the deployment URL with or
+without a trailing slash and with or without a trailing `/nifi-api`, so all of these work:
 
 ```
 https://dfx.<env-id>.<region>.cloudera.site/<deployment-namespace>
@@ -333,76 +406,125 @@ Every response carries a `request_status` block:
 ```
 
 The agent is instructed to state explicitly when sections failed, so a partial report is
-never presented as a complete one. Per-section error returns:
+never presented as a complete one.
 
-| Condition | Keys |
-| --- | --- |
-| `401` / `403` | `error`, `url`, `status_code`, `hint` about workload password setup |
-| `404` | `error`, `url`, `status_code`, `hint` about base URL and process group ID |
-| Other non-2xx | `error`, `url`, `status_code`, `raw_output` (truncated) |
-| Body wasn't JSON | `error`, `url`, `raw_output`, `hint` that an HTML body means a gateway login page |
-| TLS verification failed | `error`, `url`, `detail` |
-| Connect / read timeout | `error`, `url` |
-| Any other request error | `error`, `url`, `error_type`, `detail` |
+Steps 1 and 2 are different: they are prerequisites, not sections. If the deployment
+lookup or the token mint fails there is nothing to report, so the tool returns early with
+a single `deployment_lookup` or `authentication` failure rather than four identical
+downstream errors.
+
+| Condition | Section | Keys |
+| --- | --- | --- |
+| CDP CLI returned non-zero | `deployment_lookup` / `authentication` | `error`, `command`, `return_code`, `stderr`, `hint` about key validity and DataFlow roles |
+| CDP CLI timed out (60s) or wasn't runnable | `deployment_lookup` / `authentication` | `error`, `command` |
+| Deployment had no `dfxLocalUrl` / `environmentCrn` | `deployment_lookup` | `error`, `missing_fields`, `hint` about the overrides |
+| Control plane returned no token | `authentication` | `error`, `returned_fields` |
+| `401` / `403` | per-section | `error`, `url`, `status_code`, `www_authenticate`, `hint` |
+| `404` | per-section | `error`, `url`, `status_code`, `hint` about base URL and process group ID |
+| `3xx` redirect | per-section | `error`, `url`, `status_code`, `redirected_to` |
+| Other non-2xx | per-section | `error`, `url`, `status_code`, `raw_output` (truncated) |
+| Body wasn't JSON | per-section | `error`, `url`, `raw_output`, `hint` that an HTML body means a gateway login page |
+| TLS verification failed | per-section | `error`, `url`, `detail` |
+| Connect / read timeout | per-section | `error`, `url` |
+| Any other request error | per-section | `error`, `url`, `error_type`, `detail` |
+
+On `401`/`403` the gateway's `WWW-Authenticate` header is passed straight through, because
+it is far more informative than the status code — it distinguishes an expired or malformed
+token (`error="invalid_token"`) from a valid token without sufficient access.
 
 Standalone test:
 
 ```bash
 python tool.py \
-  --user-params '{"NIFI_BASE_URL":"https://dfx.<env>.cloudera.site/<namespace>","NIFI_USERNAME":"<workload-user>","NIFI_PASSWORD":"<workload-password>"}' \
-  --tool-params '{"process_group_id":"root"}'
+  --user-params '{"CDP_ACCESS_KEY_ID":"<key-id>","CDP_PRIVATE_KEY":"<private-key>"}' \
+  --tool-params '{"deployment_crn":"crn:cdp:df:...","process_group_id":"root"}'
 ```
 
-#### Authentication here is an unresolved question
+#### How authentication was worked out
 
-> ⚠️ **The auth mechanism this tool uses is not documented by Cloudera.** It is the most
-plausible approach, not a confirmed one, and it may not work in your environment. Being
-straight about this matters more than the template looking finished.
+This tool originally used HTTP Basic auth with CDP workload credentials, which seemed the
+most plausible mechanism and is undocumented either way. It returned `401` on every
+endpoint. Probing the gateway settled why, and the answer is useful enough to write down.
 
-What the documentation actually says:
+**HTTP Basic auth cannot work here.** Three independent signals, all reproducible against
+a live deployment with `curl`:
 
-- Cloudera documents **interactive SSO** for reaching a deployment's NiFi UI, using
-  Cloudera SSO credentials — [viewing a deployment in NiFi](https://docs.cloudera.com/dataflow/cloud/managing-deployments/topics/cdf-viewing-dataflow-in-nifi.html).
-- The workload password is documented for "non-UI workload interfaces" generally, while
-  NiFi is specifically listed as an **SSO-based** interface —
+```console
+$ curl -s <base>/nifi-api/access/config
+{"config":{"supportsLogin":false}}
+
+$ curl -s -X POST <base>/nifi-api/access/token -d 'username=x&password=y'
+Username/Password login not supported by this NiFi.          # HTTP 409
+
+$ curl -si <base>/nifi-api/flow/about | head -1               # no credentials
+HTTP/2 401
+```
+
+NiFi behind the gateway has **no username/password login provider at all**
+(`supportsLogin: false`). The `401` carries **no `WWW-Authenticate: Basic` header**, which
+per [RFC 7235](https://datatracker.ietf.org/doc/html/rfc7235#section-4.1) a server
+accepting Basic auth is required to send. And the response is **byte-identical** with
+correct credentials, with deliberately wrong ones, and with none at all — the credentials
+are never evaluated. So a `401` here is not a credential problem, a permissions problem,
+or a wrong-deployment problem.
+
+**The gateway is an OAuth2 resource server expecting a signed JWT.** Sending a `Bearer`
+header gets it parsed rather than ignored:
+
+```console
+$ curl -s -H 'Authorization: Bearer notatoken' <base>/nifi-api/flow/about
+Unauthorized error="invalid_token", error_description="An error occurred while
+attempting to decode the Jwt: Malformed token", ...
+
+$ curl -s -H 'Authorization: Bearer <well-formed JWT, bad signature>' <base>/nifi-api/flow/about
+Unauthorized error="invalid_token", error_description="An error occurred while
+attempting to decode the Jwt: Signed JWT rejected: Another algorithm expected,
+or no matching key(s) found", ...
+```
+
+It decoded the JWT and rejected the *signature*. That is a server telling you exactly
+which credential it wants.
+
+**CDP mints that credential.** `cdp iam generate-workload-auth-token` takes
+`--workload-name DF` and, for DF, a required `--environment-crn`, returning `token`,
+`endpointUrl` and `expireAt`. That is what the tool now sends. The field names used to
+chain the calls were read from the CDP CLI's own published service models
+(`cdpcli/data/df/df.yaml`, `cdpcli/data/iam/iam.yaml`) rather than guessed.
+
+> **Still to confirm end-to-end.** What is *proven* is that Basic auth cannot work and
+> that the gateway wants a signed JWT. What is **not yet proven** is that a DF workload
+> token is accepted by `/nifi-api` — minting one needs a valid CDP API key, and the key
+> available during development had been rotated (`NOT_FOUND: Access key ... not found`).
+> If your run fails, the `www_authenticate` value in the output says whether the token was
+> rejected as `invalid_token` (wrong or expired credential) or for insufficient access
+> (right credential, missing DataFlow role).
+
+What the documentation says, for context:
+
+- Cloudera documents **interactive SSO** for reaching a deployment's NiFi UI —
+  [viewing a deployment in NiFi](https://docs.cloudera.com/dataflow/cloud/managing-deployments/topics/cdf-viewing-dataflow-in-nifi.html).
+- NiFi is specifically listed as an **SSO-based** interface, which is consistent with
+  `supportsLogin: false` —
   [workload password](https://docs.cloudera.com/management-console/cloud/user-management/topics/mc-setting-the-ipa-password.html),
   [non-SSO interfaces](https://docs.cloudera.com/management-console/cloud/user-management/topics/mc-accessing-non-sso-interfaces-using-ipa-credentials.html).
-- The **only** officially documented HTTP Basic auth path through the DFX gateway is the
-  **Prometheus metrics endpoint**, and it uses a dedicated generated `nifi-metrics`
-  credential rather than a user's workload password —
+- The only documented HTTP Basic path through the DFX gateway is the **Prometheus metrics
+  endpoint**, using a dedicated generated `nifi-metrics` credential —
   [accessing NiFi metrics](https://docs.cloudera.com/dataflow/cloud/manage-environment/topics/cdf-access-nifi-metrics.html).
-- For Knox-fronted NiFi generally, Cloudera community guidance warns that a NiFi bearer
-  token "would not work as Knox does not recognize this token… the URL always redirects
-  to the SSO URL" —
-  [community article](https://community.cloudera.com/t5/Community-Articles/How-to-access-NiFi-Rest-API-through-SSO-enabled-Knox-Proxy/ta-p/298863).
+  Note that this lives on its own port and path; a bare `/federate` against the deployment
+  base URL returns NiFi's "Did you mean /nifi" HTML page with a `200` status, which is easy
+  to mistake for success.
 
-No documentation was found describing a supported way to call general `/nifi-api`
-endpoints programmatically through the DFX gateway.
-
-**So the tool is built to fail legibly.** It does not follow redirects, because a gateway
-that bounces the request to SSO would otherwise return an HTML login page with a `200`
-status — which looks like a parsing bug rather than an auth refusal. Instead you get:
-
-```json
-{
-  "error": "The gateway redirected the request instead of serving the NiFi API, which indicates it requires interactive SSO rather than HTTP Basic authentication.",
-  "status_code": 302,
-  "redirected_to": "https://.../gateway/knoxsso/api/v1/websso?originalUrl=...",
-  "hint": "HTTP Basic authentication with CDP workload credentials is not an access method Cloudera documents for /nifi-api through the DFX gateway. ..."
-}
-```
-
-A `302` means the mechanism is wrong and no credential fix will help. A persistent `401`
-may mean the same thing. Either way, the documented fallbacks are:
+**The tool is built to fail legibly.** It does not follow redirects, because a gateway that
+bounces the request to SSO would otherwise return an HTML login page with a `200` status —
+which looks like a parsing bug rather than an auth refusal. Remaining fallbacks if the
+token route does not work out:
 
 | Alternative | Trade-off |
 | --- | --- |
-| **Prometheus metrics endpoint** (`/federate`) with the generated `nifi-metrics` credential | Officially documented and supported for programmatic access. Returns Prometheus metrics, not NiFi API JSON, so the tool would need to parse a different format — but it gives real flow-level numbers. |
-| **`cdp iam generate-workload-auth-token --workload-name DF`** as a bearer token | A real, documented CDP CLI command, but the token appears scoped to the DataFlow *workload control-plane* API rather than the embedded NiFi. Unconfirmed against `/nifi-api` — empirically testable. |
+| **Prometheus metrics endpoint** with the generated `nifi-metrics` credential | Officially documented and supported. Returns Prometheus text, not NiFi API JSON, so it needs a different parser — but it gives real flow-level numbers. |
 | **Stay on the control plane** ([example 1](#1-nifi-monitoring-agents)) | Fully supported, but cannot see inside the flow. |
 
-If you confirm what actually works in your environment, that result belongs in this
-section.
+If you confirm what works in your environment, that result belongs in this section.
 
 ---
 
@@ -425,14 +547,12 @@ section.
 > **Planned, not yet implemented.** The repo name describes where this is going; today
 > only the read-only monitoring examples above exist.
 
-- **Chaining the two layers** — one workflow that takes a deployment CRN, resolves its
-  NiFi URL from the control plane, then inspects the canvas, so a single run covers both
-  layers without hand-configuring a base URL. This is already feasible:
-  `df describe-deployment` returns `nifiUrl`, `dfxLocalUrl`, and `cfmNifiVersion`
-  (confirmed in Cloudera's published
-  [CDP CLI model](https://raw.githubusercontent.com/cloudera/cdpcli/master/cdpcli/data/df/df.yaml)),
-  so example 1's tool already has the base URL example 2 needs.
-- **A Prometheus-metrics tool** — using the documented `/federate` endpoint and the
+- **Comparing the two layers, not just reading both.** Example 2 now resolves a
+  deployment and reads its canvas in one call, so the data is there; the next step is an
+  agent whose job is specifically to find *disagreement* — control plane `RUNNING` while
+  the canvas has invalid processors or a stalled queue — and to treat that gap as the
+  finding rather than reporting the layers side by side.
+- **A Prometheus-metrics tool** — using the documented metrics endpoint and the
   `nifi-metrics` credential, which may be the supported route to flow-level numbers if
   direct `/nifi-api` access proves unavailable.
 - **Provenance and deeper flow inspection** — provenance queries and per-connection
