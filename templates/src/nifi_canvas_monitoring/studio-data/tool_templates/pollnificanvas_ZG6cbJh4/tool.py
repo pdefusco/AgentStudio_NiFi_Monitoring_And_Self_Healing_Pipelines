@@ -45,11 +45,17 @@ API key pair, the same pair the companion `pollNifiFlow` tool uses:
 Given a deployment CRN, the tool resolves everything else, chaining the
 two monitoring layers together:
 
-    df describe-deployment  ->  deployment.dfxLocalUrl          (API base)
+    df describe-deployment  ->  deployment.nifiUrl              (API base)
                             ->  deployment.service.environmentCrn
     iam generate-workload-auth-token --workload-name DF
                             ->  token
-    GET <dfxLocalUrl>/nifi-api/...  with Authorization: Bearer <token>
+    GET <nifiUrl minus /nifi>/nifi-api/...
+                                with Authorization: Bearer <token>
+
+`nifiUrl` is the deployment's own address and is the field to build on.
+`dfxLocalUrl`, also returned, is the base of the shared dfx-local
+instance and omits the per-deployment namespace the gateway routes on;
+requests built from it are answered 403.
 
 The agent only needs to provide:
 
@@ -332,20 +338,33 @@ def generate_workload_token(
 
 def normalize_base_url(raw_url: str) -> str:
     """
-    Build the `/nifi-api` root from a deployment base URL.
+    Build the `/nifi-api` root from a deployment URL.
 
-    Accepts the URL with or without a trailing slash, and with or
-    without a trailing `/nifi-api`, so that all of these work:
+    The value this is usually given is the deployment's `nifiUrl`, which
+    addresses the NiFi *canvas* — it ends in `/nifi` and may carry a
+    query string or a `#` fragment naming a process group. The REST API
+    is a sibling of that path, not a child of it, so the `/nifi` segment
+    is replaced rather than appended to.
+
+    All of these therefore yield the same root:
 
         https://dfx.<env>.cloudera.site/<namespace>
         https://dfx.<env>.cloudera.site/<namespace>/
+        https://dfx.<env>.cloudera.site/<namespace>/nifi
+        https://dfx.<env>.cloudera.site/<namespace>/nifi/
+        https://dfx.<env>.cloudera.site/<namespace>/nifi/#/process-groups/abc
         https://dfx.<env>.cloudera.site/<namespace>/nifi-api
     """
 
-    url = raw_url.strip().rstrip("/")
+    # A fragment is client-side only and a query string selects a view
+    # in the canvas; neither belongs in an API path.
+    url = raw_url.strip().split("#", 1)[0].split("?", 1)[0].rstrip("/")
 
     if url.endswith("/nifi-api"):
         return url
+
+    if url.endswith("/nifi"):
+        url = url[: -len("/nifi")]
 
     return f"{url}/nifi-api"
 
@@ -452,12 +471,18 @@ def get_json(
             "status_code": response.status_code,
             "www_authenticate": response.headers.get("WWW-Authenticate", ""),
             "hint": (
-                "The workload token may have expired, or the user may "
-                "lack a DataFlow role granting access to this "
-                "deployment. A token is minted per tool call, so an "
-                "immediate rejection points at permissions rather than "
-                "expiry. Note that HTTP Basic authentication is not an "
-                "option here: NiFi behind this gateway reports "
+                "A 401, or a 403 whose WWW-Authenticate mentions "
+                "invalid_token, means the token itself was refused. A "
+                "403 with no WWW-Authenticate header means the token was "
+                "accepted and the request was still not permitted, which "
+                "has two quite different causes: the URL may address a "
+                "path this deployment does not own, or the CDP user may "
+                "lack a DataFlow role on it. Check the URL first -- it "
+                "must carry the deployment's own namespace segment, as "
+                "deployment.nifiUrl does and deployment.dfxLocalUrl does "
+                "not. Expiry is not a likely cause, since a token is "
+                "minted per tool call. HTTP Basic authentication is not "
+                "an option here either: NiFi behind this gateway reports "
                 "supportsLogin: false."
             ),
         }
@@ -581,7 +606,14 @@ def run_tool(config: UserParameters, args: ToolParameters) -> Any:
             ),
         }
 
-        base_url = base_url or deployment.get("dfxLocalUrl")
+        # `nifiUrl`, not `dfxLocalUrl`. Both are returned, and only one
+        # is right: dfxLocalUrl is the base of the shared dfx-local
+        # instance hosting many deployments, so it omits the
+        # per-deployment namespace segment that the gateway routes on.
+        # Requests built from it reach the gateway and are answered with
+        # 403 — authenticated, but not entitled to that path — which
+        # reads exactly like a missing DataFlow role.
+        base_url = base_url or deployment.get("nifiUrl")
         environment_crn = environment_crn or (
             (deployment.get("service") or {}).get("environmentCrn")
         )
@@ -589,7 +621,7 @@ def run_tool(config: UserParameters, args: ToolParameters) -> Any:
         missing = [
             name
             for name, value in (
-                ("dfxLocalUrl", base_url),
+                ("nifiUrl", base_url),
                 ("service.environmentCrn", environment_crn),
             )
             if not value
@@ -656,6 +688,11 @@ def run_tool(config: UserParameters, args: ToolParameters) -> Any:
 
     api_root = normalize_base_url(base_url)
     result["nifi_api_root"] = api_root
+
+    # Also reported unmodified, so that a base URL which normalized into
+    # something unexpected can be told apart from one that was wrong to
+    # begin with.
+    result["nifi_url_source"] = base_url
 
     session = requests.Session()
     session.headers.update({
