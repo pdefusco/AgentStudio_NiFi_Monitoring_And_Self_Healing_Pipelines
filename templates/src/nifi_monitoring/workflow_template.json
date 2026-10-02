@@ -1,0 +1,64 @@
+{
+  "template_version": "0.0.1",
+  "workflow_template": {
+    "id": "e2447f58-8914-4eb7-b44f-522489cbee54",
+    "name": "NiFi Monitoring Agents",
+    "description": "",
+    "process": "sequential",
+    "agent_template_ids": [
+      "5fc0be9b-2862-4c89-ba58-8bb2203492aa"
+    ],
+    "task_template_ids": [
+      "af169f3a-6fa8-4684-8494-0f275c9db0d3"
+    ],
+    "is_conversational": false,
+    "pre_packaged": false,
+    "smart_workflow": true,
+    "planning": false
+  },
+  "agent_templates": [
+    {
+      "id": "5fc0be9b-2862-4c89-ba58-8bb2203492aa",
+      "workflow_template_id": "e2447f58-8914-4eb7-b44f-522489cbee54",
+      "name": "NiFi Monitoring Agent",
+      "description": "NiFi Monitoring Agent",
+      "role": "Cloudera DataFlow NiFi Deployment Monitor",
+      "backstory": "You are an infrastructure monitoring agent specializing in Apache NiFi\ndeployments running in Cloudera DataFlow Public Cloud.\n\nYou use Cloudera APIs and the provided tools to inspect real deployment\nstate. You do not fabricate deployment information. When deployment\ninformation is requested, you retrieve it using the available monitoring\ntools and summarize the returned information for the user.",
+      "goal": "Monitor and inspect Apache NiFi deployments running in Cloudera DataFlow Public Cloud.\n\nWhen given a deployment CRN, you MUST use the `pollNifiFlow` tool to retrieve the deployment before answering. Never answer a deployment inspection request from prior knowledge or assumptions.\n\nUse the actual tool observation as the source of deployment information.",
+      "allow_delegation": false,
+      "verbose": false,
+      "cache": false,
+      "temperature": 0.10000000149011612,
+      "max_iter": 0,
+      "tool_template_ids": [
+        "576efd81-28c5-403e-893d-f6003332361d"
+      ],
+      "mcp_template_ids": [],
+      "pre_packaged": false,
+      "agent_image_path": ""
+    }
+  ],
+  "tool_templates": [
+    {
+      "id": "576efd81-28c5-403e-893d-f6003332361d",
+      "workflow_template_id": "e2447f58-8914-4eb7-b44f-522489cbee54",
+      "name": "pollNifiFlow",
+      "python_code_file_name": "tool.py",
+      "python_requirements_file_name": "requirements.txt",
+      "source_folder_path": "studio-data/tool_templates/pollnififlow_5LneKOim",
+      "pre_built": false,
+      "tool_image_path": "",
+      "is_venv_tool": true
+    }
+  ],
+  "mcp_templates": [],
+  "task_templates": [
+    {
+      "id": "af169f3a-6fa8-4684-8494-0f275c9db0d3",
+      "workflow_template_id": "e2447f58-8914-4eb7-b44f-522489cbee54",
+      "description": "Inspect the Cloudera DataFlow NiFi deployment identified by the provided deployment CRN.\n\nUse the pollNifiFlow tool to retrieve the actual deployment information.\n\nDo not simulate, guess, or invent deployment information. Base the final response exclusively on information returned by the tool.\n\nDeployment CRN:\n\n{deployment_crn}",
+      "expected_output": "A Deployment Status Report containing:\n\n- API Request Status: Succeeded or Failed\n- Deployment CRN\n- Current Deployment Status\n- Relevant deployment information returned by Cloudera DataFlow\n- Error Message, if the API request or tool execution failed\n\nThe report must be based exclusively on the actual output returned by the pollNifiFlow tool. Do not infer or fabricate deployment information.",
+      "assigned_agent_template_id": "5fc0be9b-2862-4c89-ba58-8bb2203492aa"
+    }
+  ]
+}
