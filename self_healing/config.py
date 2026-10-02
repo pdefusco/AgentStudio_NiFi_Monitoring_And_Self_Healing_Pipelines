@@ -279,26 +279,33 @@ ACTION_SELECTION = _str("SELFHEAL_ACTION_SELECTION", "alternate")
 # built. A mutating call whose target appears here is refused outright,
 # regardless of what else matches: a stale CRN in a state file must not
 # be able to restart a colleague's deployment.
+#
+# Deliberately unlabelled. These are other people's deployments in a
+# shared tenant, and this file is public; the flow and environment names
+# they carry are not ours to publish, and the guardrail does not need
+# them — it compares CRNs. Grouped by the environment each belongs to,
+# which is the only structure worth preserving: three environments, and
+# the last two deployments are the pair the templates read.
 DENYLIST_DEPLOYMENT_CRNS = frozenset(
     {
-        # se-sandbox-aws, not ours
+        # pre-existing, not ours
         "crn:cdp:df:us-west-1:558bc1d2-8867-4357-8524-311d51259233"
         ":deployment:41519649-07da-49d8-bbdc-0bc6777a7c82"
-        "/d6a50727-0f28-4cc4-abc9-895a50bf5a78",  # Ingest-Buddy-Notes-Kafka
+        "/d6a50727-0f28-4cc4-abc9-895a50bf5a78",
         "crn:cdp:df:us-west-1:558bc1d2-8867-4357-8524-311d51259233"
         ":deployment:41519649-07da-49d8-bbdc-0bc6777a7c82"
-        "/87c7b71e-fef2-48ea-bc79-ca2ea1a7204f",  # buddy-transcripts-2-iceberg
-        # geo-hol3-cdp-env
+        "/87c7b71e-fef2-48ea-bc79-ca2ea1a7204f",
+        # a second environment
         "crn:cdp:df:us-west-1:558bc1d2-8867-4357-8524-311d51259233"
         ":deployment:82b59980-f675-4aa6-80c7-8a78a33e8cd3"
-        "/04424a12-666d-400c-bcd0-0ee9e84c9d9a",  # Receive Edge Data
-        # marriott-poc-cdp-env, monitored read-only by the templates
+        "/04424a12-666d-400c-bcd0-0ee9e84c9d9a",
+        # a third, monitored read-only by the templates
         "crn:cdp:df:us-west-1:558bc1d2-8867-4357-8524-311d51259233"
         ":deployment:f4a3c788-daf5-45ba-aa7a-374b730beac5"
-        "/df7e8fd0-7395-4f67-92fd-b8b6fa30a70f",  # ListenSyslog filter to S3
+        "/df7e8fd0-7395-4f67-92fd-b8b6fa30a70f",
         "crn:cdp:df:us-west-1:558bc1d2-8867-4357-8524-311d51259233"
         ":deployment:f4a3c788-daf5-45ba-aa7a-374b730beac5"
-        "/889ad171-3796-4862-b531-01a57bffc314",  # Marriott-rewards-flow
+        "/889ad171-3796-4862-b531-01a57bffc314",
     }
 )
 
