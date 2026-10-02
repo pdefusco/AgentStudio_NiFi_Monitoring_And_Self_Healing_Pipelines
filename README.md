@@ -177,16 +177,31 @@ import still fails. Going through `python -m pip` cannot drift.
 
 `cdpcli` is a large dependency and takes a few minutes to install; that is normal.
 
-Then run the tool with that interpreter:
+Then export your credentials and run the tool through `run_tool_local.py`:
 
 ```bash
-./.venv/bin/python templates/src/<template>/studio-data/tool_templates/<tool>/tool.py \
-  --user-params '{...}' \
-  --tool-params '{...}'
+export CDP_ACCESS_KEY_ID=<your-key-id>
+export CDP_PRIVATE_KEY=<your-private-key>   # the key itself, or a path to a file holding it
+
+./.venv/bin/python templates/src/run_tool_local.py nifi_canvas_monitoring \
+  --tool-params '{"deployment_crn":"crn:cdp:df:<region>:<account>:deployment:<id>"}'
 ```
 
-For example 1 (`pollNifiFlow`), whose source lives only inside its `.zip`, unzip it
-somewhere first:
+The helper reads the template's own `workflow_template.json` to find the tool, then fills
+each `UserParameters` field from an environment variable of the same name — standing in for
+the injection Agent Studio does from the tool's saved configuration. Optional fields with no
+variable set keep their defaults, and it says which ones those were. Add `--tool` when a
+template declares more than one tool.
+
+Passing credentials this way, rather than inside `--user-params`, keeps a private key out of
+your shell history and out of the process list, where any other user on the machine could
+read it from `ps`.
+
+Each `tool.py` also has its own `__main__` entrypoint taking `--user-params` and
+`--tool-params` as JSON strings — the same contract Agent Studio uses. Reach for that when
+you want to pass a value no environment variable holds, or when you have unzipped a template
+and are running its `tool.py` outside this repository (example 1's source lives only inside
+its `.zip`):
 
 ```bash
 ./.venv/bin/python tool.py \
@@ -194,8 +209,8 @@ somewhere first:
   --tool-params '{"deployment_crn":"crn:cdp:df:<region>:<account>:deployment:<id>"}'
 ```
 
-It prints the tool's return value as indented JSON. If this works and the agent doesn't,
-the problem is in the workflow wiring, not in the Cloudera API call.
+Either way you get the tool's return value as indented JSON. If this works and the agent
+doesn't, the problem is in the workflow wiring, not in the Cloudera API call.
 
 `.venv/` is git-ignored.
 
@@ -211,6 +226,7 @@ the problem is in the workflow wiring, not in the Cloudera API call.
     ├── workflow_template_gvie9za2.zip      # importable: NiFi Canvas Monitoring Agents
     └── src/                                # unpacked sources, for review and rebuilds
         ├── build_template.py               # packs a source dir into an importable .zip
+        ├── run_tool_local.py               # runs one template's tool outside Agent Studio
         └── nifi_canvas_monitoring/
             ├── workflow_template.json
             └── studio-data/tool_templates/pollnificanvas_ZG6cbJh4/
