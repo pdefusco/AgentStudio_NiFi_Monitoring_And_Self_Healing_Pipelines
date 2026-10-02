@@ -1,0 +1,17 @@
+# Installed into the Cloudera AI project by setup_runtime.py, not by the
+# monitor job: a job on a one-minute schedule must never pip-install.
+#
+# cdpcli is pinned because this prototype depends on details of its
+# behaviour, not just its API surface: the `-c` entry point, the
+# `dfworkload` service and its two-hop workload-token discovery, and the
+# `process_kpis` extension that rewrites a KPI payload before sending it.
+cdpcli==0.9.164
+
+# cmlapi is preinstalled inside a Cloudera AI session and is NOT on PyPI.
+# Locally it has to come from the workspace itself, which is why it is a
+# comment rather than a requirement:
+#
+#   pip install https://ml-cbdbb7f3-746.pdf0926.a465-9q4k.cloudera.site/api/v2/python.tar.gz
+#
+# It is needed only by create_job.py, and only when registering the job
+# from outside the workspace.

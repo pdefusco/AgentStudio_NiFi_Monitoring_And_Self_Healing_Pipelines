@@ -13,6 +13,11 @@ __pycache__/
 venv/
 .ipynb_checkpoints/
 
+# Self-healing prototype runtime state. The Cloudera AI job writes its
+# state machine, lock and audit log here every minute; committing them
+# would mean a dirty tree and a merge conflict on every run.
+self_healing/state/
+
 # OS / editor
 .DS_Store
 .idea/

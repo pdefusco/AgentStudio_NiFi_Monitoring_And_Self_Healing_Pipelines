@@ -1,0 +1,160 @@
+{
+  "externalControllerServices": {},
+  "flowContents": {
+    "comments": "Synthetic oscillating flow for the self-healing prototype. 600 flowfiles every 600s, drained at ~2/s.",
+    "componentType": "PROCESS_GROUP",
+    "connections": [
+      {
+        "backPressureDataSizeThreshold": "1 GB",
+        "backPressureObjectThreshold": 10000,
+        "bends": [],
+        "comments": null,
+        "componentType": "CONNECTION",
+        "destination": {
+          "comments": null,
+          "groupId": "e68e16b6-06ef-5c68-a9b2-99c52e76fa9d",
+          "id": "a7adc3de-e205-5c45-80ef-cf83d04bc1c3",
+          "instanceIdentifier": null,
+          "name": "Slow Drain",
+          "type": "PROCESSOR"
+        },
+        "flowFileExpiration": "0 sec",
+        "groupIdentifier": "e68e16b6-06ef-5c68-a9b2-99c52e76fa9d",
+        "identifier": "5be42421-35cd-56b9-b887-b4b7d2d517b0",
+        "instanceIdentifier": null,
+        "labelIndex": 1,
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "name": "pdf-selfheal-queue",
+        "partitioningAttribute": null,
+        "position": null,
+        "prioritizers": [],
+        "selectedRelationships": [
+          "success"
+        ],
+        "source": {
+          "comments": null,
+          "groupId": "e68e16b6-06ef-5c68-a9b2-99c52e76fa9d",
+          "id": "00aacd34-e570-53e4-96e4-77e5ae6ae937",
+          "instanceIdentifier": null,
+          "name": "Burst Generator",
+          "type": "PROCESSOR"
+        },
+        "zIndex": 0
+      }
+    ],
+    "controllerServices": [],
+    "defaultBackPressureDataSizeThreshold": "1 GB",
+    "defaultBackPressureObjectThreshold": 10000,
+    "defaultFlowFileExpiration": "0 sec",
+    "executionEngine": null,
+    "flowFileConcurrency": "UNBOUNDED",
+    "flowFileOutboundPolicy": "STREAM_WHEN_AVAILABLE",
+    "funnels": [],
+    "groupIdentifier": null,
+    "identifier": "e68e16b6-06ef-5c68-a9b2-99c52e76fa9d",
+    "inputPorts": [],
+    "instanceIdentifier": null,
+    "labels": [],
+    "logFileSuffix": null,
+    "maxConcurrentTasks": null,
+    "name": "pdf-selfheal-oscillator",
+    "outputPorts": [],
+    "parameterContextName": null,
+    "position": null,
+    "processGroups": [],
+    "processors": [
+      {
+        "annotationData": null,
+        "autoTerminatedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "bulletinLevel": "WARN",
+        "bundle": {
+          "artifact": "nifi-standard-nar",
+          "group": "org.apache.nifi",
+          "version": "2.6.0.4.12.0.2-1"
+        },
+        "comments": "",
+        "componentType": "PROCESSOR",
+        "concurrentlySchedulableTaskCount": 1,
+        "executionNode": "ALL",
+        "groupIdentifier": "e68e16b6-06ef-5c68-a9b2-99c52e76fa9d",
+        "identifier": "00aacd34-e570-53e4-96e4-77e5ae6ae937",
+        "instanceIdentifier": null,
+        "maxBackoffPeriod": "10 mins",
+        "name": "Burst Generator",
+        "penaltyDuration": "30 sec",
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "properties": {
+          "Batch Size": "600",
+          "Data Format": "Text",
+          "File Size": "0B",
+          "Unique FlowFiles": "false",
+          "character-set": "UTF-8"
+        },
+        "propertyDescriptors": {},
+        "retriedRelationships": [],
+        "retryCount": 10,
+        "runDurationMillis": 0,
+        "scheduledState": "ENABLED",
+        "schedulingPeriod": "600 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "style": {},
+        "type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+        "yieldDuration": "1 sec"
+      },
+      {
+        "annotationData": null,
+        "autoTerminatedRelationships": [
+          "success"
+        ],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "bulletinLevel": "WARN",
+        "bundle": {
+          "artifact": "nifi-update-attribute-nar",
+          "group": "org.apache.nifi",
+          "version": "2.6.0.4.12.0.2-1"
+        },
+        "comments": "",
+        "componentType": "PROCESSOR",
+        "concurrentlySchedulableTaskCount": 2,
+        "executionNode": "ALL",
+        "groupIdentifier": "e68e16b6-06ef-5c68-a9b2-99c52e76fa9d",
+        "identifier": "a7adc3de-e205-5c45-80ef-cf83d04bc1c3",
+        "instanceIdentifier": null,
+        "maxBackoffPeriod": "10 mins",
+        "name": "Slow Drain",
+        "penaltyDuration": "30 sec",
+        "position": {
+          "x": 0.0,
+          "y": 400.0
+        },
+        "properties": {
+          "Store State": "Do not store state",
+          "canonical-value-lookup-cache-size": "100"
+        },
+        "propertyDescriptors": {},
+        "retriedRelationships": [],
+        "retryCount": 10,
+        "runDurationMillis": 0,
+        "scheduledState": "ENABLED",
+        "schedulingPeriod": "1 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "style": {},
+        "type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+        "yieldDuration": "1 sec"
+      }
+    ],
+    "remoteProcessGroups": [],
+    "scheduledState": null,
+    "statelessFlowTimeout": null,
+    "versionedFlowCoordinates": null
+  },
+  "flowEncodingVersion": "1.0",
+  "latest": false,
+  "parameterContexts": {},
+  "parameterProviders": {}
+}
