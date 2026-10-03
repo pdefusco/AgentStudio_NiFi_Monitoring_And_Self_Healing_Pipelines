@@ -817,6 +817,16 @@ def selftest(verbose: bool = True) -> bool:
 
     ok = True
 
+    # Name the target before dialling it. A CRN that points at a deleted
+    # service fails in a way that reads as a credentials or permissions
+    # problem -- measured 2026-10-03, it cost an afternoon -- and the one
+    # fact that would have settled it in a line is which service was
+    # being asked. It is also what the guardrail compares against, so
+    # printing it here explains a later "unexpected DataFlow service"
+    # refusal without a code read.
+    if verbose:
+        print(f"  service:  {config.SERVICE_CRN}")
+
     control = df("list-deployments")
 
     if "error" in control:

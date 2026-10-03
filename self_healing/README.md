@@ -289,6 +289,29 @@ human supplies a CRN by hand, `teardown.py --deployment-crn`. Treat the
 monitor as protected by three live conditions, not four. The denylist and
 the live prefix read are the two that would actually stop a wrong target.
 
+**Condition 4 has now fired for real, and not on the half anyone expected.**
+Measured 2026-10-03, on a live breach at a queue depth of 402, the monitor
+reached its second consecutive breach, decided to act, and was refused:
+
+```
+action:           restart_deployment (armed=False)
+  REFUSED: deployment is in an unexpected DataFlow service.
+  found:    …:service:707b5faf-765b-44b1-977b-8b25a21aca07
+  expected: …:service:41519649-07da-49d8-bbdc-0bc6777a7c82
+```
+
+The target was correct; `config.SERVICE_CRN` was stale, left pointing at a
+DataFlow service that had since been deleted. So the condition did its job
+against a **misconfigured guard** rather than a wrong target — which is a
+failure mode worth naming, because the loop had detected perfectly for an
+hour and would have gone on doing so. It is also the argument for the
+service CRN being printed by `--selftest`: the refusal is legible in one
+line only if you already know what the guard expects.
+
+Note what the refusal did *not* do: no `ACTING` was written, because that
+transition is gated on `--arm`. A refused unarmed run leaves the machine in
+`BREACH_PENDING` and nothing needs repairing by hand.
+
 `dfworkload update-deployment --kpis` is used **nowhere** in this
 prototype: it is a deployment-level whole-array replace with no undo, and
 against the wrong CRN it silently erases someone else's KPIs.

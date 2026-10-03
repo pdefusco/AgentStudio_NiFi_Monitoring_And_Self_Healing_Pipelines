@@ -50,19 +50,32 @@ def _int(name: str, default: int) -> int:
 # Target: Cloudera DataFlow
 # ---------------------------------------------------------------------
 
-# The `se-sandbox-aws` DataFlow service and the environment it runs in.
+# The `pdf0926-cdp-env` DataFlow service and the environment it runs in.
 # Every `dfworkload` command needs the environment CRN; `df_api.dfw()`
 # injects it so no caller can forget.
+#
+# These defaults were previously the `se-sandbox-aws` service, which has
+# since been deleted — and a deleted default is worse than no default.
+# Measured 2026-10-03: the control plane still answered (the environment
+# outlives its DataFlow service), the workload plane failed with a bare
+# "the CDP CLI returned an error", and the self-test blamed credentials
+# and the DataFlow role. The real cause was a target that no longer
+# existed. Worse, on a live breach the guardrail refused the remediation
+# with "deployment is in an unexpected DataFlow service" — correct
+# behaviour, but triggered by a stale default rather than a wrong target.
+#
+# A scheduled job has no shell to `export` into, so the default is what
+# it gets. Keep these pointing at a service that exists.
 SERVICE_CRN = _str(
     "SELFHEAL_SERVICE_CRN",
     "crn:cdp:df:us-west-1:558bc1d2-8867-4357-8524-311d51259233"
-    ":service:41519649-07da-49d8-bbdc-0bc6777a7c82",
+    ":service:707b5faf-765b-44b1-977b-8b25a21aca07",
 )
 
 ENVIRONMENT_CRN = _str(
     "SELFHEAL_ENVIRONMENT_CRN",
     "crn:cdp:environments:us-west-1:558bc1d2-8867-4357-8524-311d51259233"
-    ":environment:0c31a8ee-56ff-4b72-99bd-08ad97d193da",
+    ":environment:d1b6341e-1a28-4f9a-8e23-9ea762567b11",
 )
 
 # Confirmed available in this service by `dfworkload list-nifi-versions`.
