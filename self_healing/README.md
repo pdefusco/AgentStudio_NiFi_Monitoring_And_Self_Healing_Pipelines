@@ -202,9 +202,25 @@ perfectly for hours and then 403 at the first real breach.
 
 ## In Cloudera AI
 
-Workspace `pdf-092826`. Note this is a *different* environment from the
-DataFlow service, which is fine — the job calls public endpoints — but it
-does mean egress matters, and `--selftest` is what surfaces that early.
+Workspace `pdf-092826`, in the `pdf0926-cdp-env` environment — the **same**
+environment as the DataFlow service it monitors. That co-location is not
+incidental, and an earlier version of this section had it wrong twice: it
+claimed a different environment, and claimed "the job calls public
+endpoints".
+
+**The job does not call only public endpoints.** Reads do, but every
+mutation — each remediation in `df_api.act` — is a `cdp dfworkload` call to
+the service's own DFX gateway, which is an `internal-` ELB private to the
+environment's VPC. So a runner outside that VPC can observe the whole
+oscillation and never be able to act on it: reads succeed, writes
+connect-time out. Measured 2026-10-03 from a laptop whose VPN carried no
+route to the VPC CIDR — the self-test minted a workload token successfully
+and then timed out connecting, which is the signature worth recognising.
+
+Hence `--selftest` checks **both** planes, and hence a scheduled job
+belongs in a workspace in the same environment as the deployment. There is
+a full in-workbench runbook at
+[`docs/workbench-setup/README.md`](../docs/workbench-setup/README.md).
 
 1. Clone this repo as the Cloudera AI project.
 2. Set `CDP_ACCESS_KEY_ID` and `CDP_PRIVATE_KEY` as project environment

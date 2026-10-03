@@ -20,7 +20,23 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PY="../.venv/bin/python"
+# Prefer the repo's local virtualenv when it exists (a laptop checkout),
+# but fall back to the interpreter on PATH. Inside a Cloudera AI session
+# there is no `.venv`: dependencies are installed to ~/.local by
+# job/setup_runtime.py, because only the project filesystem persists
+# across job runs. Hard-coding the venv path makes this script
+# laptop-only, which is exactly backwards -- the workload plane is
+# reachable from inside the environment and often not from outside.
+if [[ -x "../.venv/bin/python" ]]; then
+    PY="../.venv/bin/python"
+else
+    PY="$(command -v python3 || command -v python)"
+fi
+
+if [[ -z "$PY" ]]; then
+    echo "error: no python3 on PATH and no ../.venv" >&2
+    exit 1
+fi
 
 export SELFHEAL_SERVICE_CRN="crn:cdp:df:us-west-1:558bc1d2-8867-4357-8524-311d51259233:service:707b5faf-765b-44b1-977b-8b25a21aca07"
 export SELFHEAL_ENVIRONMENT_CRN="crn:cdp:environments:us-west-1:558bc1d2-8867-4357-8524-311d51259233:environment:d1b6341e-1a28-4f9a-8e23-9ea762567b11"
@@ -98,16 +114,16 @@ step "4. the queue-depth KPI (not optional)"
 $PY provision/03_configure_kpi.py $DRY
 $PY provision/03_configure_kpi.py --verify-only
 
-cat <<'EOF'
+cat <<EOF
 
 Done through step 4. Next, by hand:
 
   # 5. watch a full 10-minute oscillation before trusting the loop
-  ../.venv/bin/python job/monitor_and_remediate.py
+  $PY job/monitor_and_remediate.py
 
   # 6. one armed run, at a breach
-  ../.venv/bin/python job/monitor_and_remediate.py --arm
+  $PY job/monitor_and_remediate.py --arm
 
   # 7. stop the billing
-  ../.venv/bin/python provision/teardown.py
+  $PY provision/teardown.py
 EOF

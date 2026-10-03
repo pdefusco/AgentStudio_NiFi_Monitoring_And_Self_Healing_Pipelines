@@ -33,8 +33,22 @@ Two honest caveats about what was verified when this was written:
   `--selftest` exists to catch — reads and mutations travel different planes,
   different hosts and different roles — so the `dfworkload` commands below are
   reproduced from this repository's previously verified usage rather than
-  re-run against this service. If they fail for you with a connect timeout, it
-  is the gateway or your network, not the command.
+  re-run against this service.
+
+  **The cause was diagnosed on 2026-10-03, and it is structural rather than
+  incidental:** that gateway host is a DNS alias for an **`internal-` AWS ELB
+  inside the environment's own VPC**, so it is reachable only from inside that
+  VPC or over a route to its CIDR. The laptop in question was on a VPN that
+  carried no such route. Step 4 below — the component KPI — is a `dfworkload`
+  call, which makes it the step this path stops at.
+
+  If `cdp dfworkload` times out for you, **follow
+  [`docs/workbench-setup/README.md`](../workbench-setup/README.md) instead**:
+  it is this same build run from a Cloudera AI session in the same environment
+  as the DataFlow service, which has both planes by construction. Note the
+  discriminator — if `--selftest` prints a workload **token expiry** and
+  *then* times out, your credentials and roles are fine and only the network
+  path is missing.
 - **The NiFi version list is not reproduced here** for the same reason
   (`list-nifi-versions` is a `dfworkload` call). Take whatever the deploy
   wizard offers. For reference, the deployment this example was originally
