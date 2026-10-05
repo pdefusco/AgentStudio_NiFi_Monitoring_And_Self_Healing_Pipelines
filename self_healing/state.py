@@ -95,6 +95,55 @@ def default_state() -> dict:
         # structurally, by component, which survives someone renaming the
         # KPI in the CDF UI. Keep it for diagnosis, not for matching.
         "chart_key": None,
+        # ---------------------------------------------------------------
+        # Handing an incident to the Agent Studio workflow.
+        #
+        # Every key below is flat, and that is a constraint rather than a
+        # style preference: `read()` does `merged.update(stored)`, a
+        # top-level merge, so a stored nested dict would wholly replace
+        # its default and a sub-key added to it later would KeyError
+        # downstream. New keys are backward-compatible only while flat.
+        # ---------------------------------------------------------------
+        "incident_id": None,
+        "incident_count": 0,
+        # Capped at one per incident. An incident that was launched once
+        # and whose outcome is unknown must not be launched again: two
+        # agents editing one flow is worse than one unconfirmed repair.
+        "incident_launch_attempts": 0,
+        "incident_launched_at": None,
+        # When the job first *observed* the flow change, which is later
+        # than the launch. Deliberately distinct from
+        # `last_action_started_at`, which stays at launch time so the
+        # metric pre-action filter stays conservative; `observe()` takes
+        # the max of the two, so neither a sample nor a drain rate can be
+        # computed from a bucket that straddles the change.
+        "incident_applied_at": None,
+        # Persisted rather than re-read from config at verify time: the
+        # state file outlives a config edit, and an in-flight run has to
+        # be judged by the mechanism that actually launched it.
+        "trigger_backend": None,
+        # "<backend>:<id>", a string rather than a dict per the flat-key
+        # rule above.
+        "run_ref": None,
+        "run_state": None,
+        "run_last_polled_at": None,
+        # The before-fingerprint, captured at launch. It costs nothing:
+        # `df_api.describe_deployment()` is already called on every run
+        # and its response already carries all four of these.
+        "flow_version_before": None,
+        "flow_version_crn_before": None,
+        "flow_updated_before": None,
+        # Whether the monitor could see its own queue before acting.
+        # Compared afterwards to detect BLINDED: a version change that
+        # does not re-supply the connection KPI erases the monitor's own
+        # eyes, and a blind monitor reporting health is the worst
+        # available outcome.
+        "chart_present_before": None,
+        "flow_version_after": None,
+        "verify_verdict": None,
+        # Which environment variable the workspace API key was found in.
+        # The name, never the value.
+        "credential_source": None,
     }
 
 

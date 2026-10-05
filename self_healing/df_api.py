@@ -192,7 +192,9 @@ def run_cdp(args: list) -> dict:
             "command": command_line(args),
             "return_code": completed.returncode,
             "stderr": (completed.stderr or "").strip()[:MAX_RAW_OUTPUT_CHARS],
-            "hint": _hint_for(completed.stderr or ""),
+            "hint": _hint_for(
+                completed.stderr or "", completed.returncode
+            ),
         }
 
     stdout = (completed.stdout or "").strip()
@@ -228,8 +230,14 @@ def run_cdp(args: list) -> dict:
         }
 
 
-def _hint_for(stderr: str) -> str:
-    """Translate a known CDP CLI failure into an actionable sentence."""
+def _hint_for(stderr: str, return_code: int = None) -> str:
+    """
+    Translate a known CDP CLI failure into an actionable sentence.
+
+    `return_code` is taken as well as the text because the single most
+    misleading case — a usage error diagnosed as a credential problem —
+    is identified by the exit status more reliably than by any message.
+    """
 
     # A missing cdpcli is an environment problem, not a credential
     # problem, and saying so saves a pointless key investigation.
@@ -264,6 +272,35 @@ def _hint_for(stderr: str) -> str:
             "so read access proves nothing about this call. DFFlowUser is "
             "enough to read metrics; configuring KPIs and restarting a "
             "deployment need more."
+        )
+
+    # A usage error is not a credential error, and the fallback below
+    # says it is. That misdiagnosis cost real time once already: a
+    # mistyped argument exited 2 and the hint sent the reader off to
+    # check their API key, which was fine all along.
+    #
+    # Return code 2 is argparse's own usage exit, which the CLI never
+    # reaches the network to produce, so it is a reliable discriminator;
+    # the text patterns catch the cases where cdpcli wraps the error and
+    # exits differently.
+    usage_markers = (
+        "Unknown options",
+        "unrecognized arguments",
+        "Invalid choice",
+        "invalid choice",
+        "arguments are required",
+        "argument operation",
+        "Unknown command",
+    )
+
+    if return_code == 2 or any(marker in stderr for marker in usage_markers):
+        return (
+            "This is a usage error from the CLI's own argument parsing, not "
+            "an authentication or permission failure — the command never "
+            "reached the API, so the credentials are not implicated. Check "
+            "the operation name and its flags against "
+            "`cdp df <operation> --help` (export PAGER=cat MANPAGER=cat "
+            "first, and pipe through `tr -d '\\b' | col -b`)."
         )
 
     return (
@@ -334,6 +371,51 @@ def describe_deployment(deployment_crn: str) -> dict:
     return result.get("deployment", result)
 
 
+def deployment_facts(deployment_crn: str) -> dict:
+    """
+    Read everything one `describe-deployment` already tells us.
+
+    The response carries `flowVersion`, `flowVersionCrn`, `flowCrn` and
+    `updated` alongside the state, and until this function existed
+    `deployment_state()` read that response and threw all of it away.
+
+    Those four fields are the entire "before" half of verifying a flow
+    version swap, so having them costs no extra call:
+
+      - `flow_version` is an int32, so `after > before` is a monotonic,
+        non-negotiable fact that nothing an agent says can influence.
+      - `updated` is milliseconds and catches a mutation that did *not*
+        bump the version, which `update-flow-in-deployment` can do.
+
+    Never raises. On a failed read every field is None and `error`
+    carries the reason, because a monitor that crashes on a transient
+    API failure is worse than one that reports UNKNOWN for a minute.
+    """
+
+    deployment = describe_deployment(deployment_crn)
+
+    if "error" in deployment:
+        return {
+            "state": "UNKNOWN",
+            "name": None,
+            "flow_version": None,
+            "flow_version_crn": None,
+            "flow_crn": None,
+            "updated": None,
+            "error": deployment.get("error"),
+        }
+
+    return {
+        "state": (deployment.get("status") or {}).get("state") or "UNKNOWN",
+        "name": deployment.get("name"),
+        "flow_version": deployment.get("flowVersion"),
+        "flow_version_crn": deployment.get("flowVersionCrn"),
+        "flow_crn": deployment.get("flowCrn"),
+        "updated": deployment.get("updated"),
+        "error": None,
+    }
+
+
 def deployment_state(deployment_crn: str) -> str:
     """
     Return the deployment's current state string.
@@ -341,14 +423,114 @@ def deployment_state(deployment_crn: str) -> str:
     Returns "UNKNOWN" if the deployment cannot be read, which the
     callers treat the same way as any other non-steady state: do not
     act.
+
+    A thin wrapper over `deployment_facts()` so there is one place that
+    knows the response shape. Note what this state is *not* good for:
+    `DeploymentState` carries `CHANGING_FLOW_VERSION` among its
+    `x-deprecated-enum-values`, so a flow version swap does **not**
+    show up here. Use `flow_facts()` to watch one of those.
     """
 
-    deployment = describe_deployment(deployment_crn)
+    return deployment_facts(deployment_crn)["state"]
 
-    if "error" in deployment:
-        return "UNKNOWN"
 
-    return (deployment.get("status") or {}).get("state") or "UNKNOWN"
+def flow_facts(deployment_crn: str, flow_crn: str = "") -> dict:
+    """
+    Read the *deployed flow* object, which is where a version swap shows.
+
+    Takes **two** CRNs because the operation requires both:
+    `--deployed-flow-crn` is mandatory, not optional, and omitting it is
+    an argparse usage error rather than a server-side one. When
+    `flow_crn` is empty this resolves it via `deployed_flow_crn()`,
+    which costs one extra call — so pass the value the job already keeps
+    in its state file where possible.
+
+    Three things live here and nowhere else:
+
+      - `flow_version`, the catalog version actually deployed.
+      - the deployed flow's own state and detailed state, which unlike
+        the deployment's does move during a version change.
+      - `valid_actions`, which is the API volunteering what it thinks
+        can be done next. When it offers RETRY_CHANGE_FLOW_VERSION or
+        CANCEL_CHANGE_FLOW_VERSION it is telling us the swap is
+        **half-applied** — the control plane mutated and the workload
+        hop did not. That is a machine-readable signal for a state no
+        amount of reading the deployment would reveal.
+
+    Never raises, for the same reason as `deployment_facts()`.
+    """
+
+    def empty(reason: str) -> dict:
+        return {
+            "crn": flow_crn or None,
+            "flow_version": None,
+            "flow_version_crn": None,
+            "state": "UNKNOWN",
+            "detailed_state": None,
+            "message": None,
+            "valid_actions": [],
+            "error": reason,
+        }
+
+    if not flow_crn:
+        flow_crn = deployed_flow_crn(deployment_crn)
+
+        if not flow_crn:
+            return empty(
+                "The deployment has no deployed flow yet, or it could not "
+                "be listed."
+            )
+
+    result = df(
+        "describe-flow-in-deployment",
+        "--deployment-crn",
+        deployment_crn,
+        "--deployed-flow-crn",
+        flow_crn,
+    )
+
+    if "error" in result:
+        return {
+            "crn": flow_crn,
+            "flow_version": None,
+            "flow_version_crn": None,
+            "state": "UNKNOWN",
+            "detailed_state": None,
+            "message": None,
+            "valid_actions": [],
+            "error": result.get("error"),
+        }
+
+    # The response key is `deployedFlow`, not `flow`.
+    flow = result.get("deployedFlow") or {}
+    status = flow.get("status") or {}
+
+    return {
+        "crn": flow.get("crn"),
+        "flow_version": flow.get("flowVersion"),
+        "flow_version_crn": flow.get("flowVersionCrn"),
+        "state": status.get("state") or "UNKNOWN",
+        "detailed_state": status.get("detailedState"),
+        "message": status.get("message"),
+        "valid_actions": list(flow.get("validActions") or []),
+        "error": None,
+    }
+
+
+# The two actions the API offers when a flow version change got stuck
+# between the control plane and the workload plane. Their presence in
+# `validActions` is how the job recognises a half-applied swap.
+HALF_APPLIED_ACTIONS = frozenset(
+    {"RETRY_CHANGE_FLOW_VERSION", "CANCEL_CHANGE_FLOW_VERSION"}
+)
+
+
+def is_half_applied(facts: dict) -> bool:
+    """True when the API is advertising a stuck flow version change."""
+
+    return bool(
+        HALF_APPLIED_ACTIONS.intersection(facts.get("valid_actions") or [])
+    )
 
 
 def wait_for_steady_state(
@@ -609,6 +791,140 @@ def assert_action_allowed(deployment_crn: str, expected_crn: str) -> dict:
     return deployment
 
 
+def assert_flow_version_allowed(
+    flow_version_crn: str,
+    expected_flow_crn: str,
+) -> dict:
+    """
+    Refuse to point our deployment at a flow version that is not ours.
+
+    **This closes the one gap `assert_action_allowed` cannot see.** That
+    function validates the *target* — which deployment is being mutated
+    — and all four of its conditions are about `--deployment-crn`. But
+    `change-flow-version-in-deployment` takes a **second** CRN,
+    `--flow-version-crn`, naming what the deployment will be pointed at.
+    A correct deployment plus a colleague's flow-version CRN therefore
+    passes every existing check and repoints our deployment at their
+    flow.
+
+    On a shared tenant whose catalog holds 20 flow definitions by
+    different authors, that is a plausible copy-paste, not a contrived
+    attack. And it is the worst shape of failure available here: every
+    guardrail reports success, the control plane reports success, and
+    the running flow is now somebody else's.
+
+    Three layers, cheapest first:
+
+      1. the version CRN is exactly our flow CRN plus a `/v.N` suffix
+      2. our flow CRN really does name a flow carrying `config.PREFIX`,
+         re-checked locally after a server-side search, because that
+         search is a substring match and this value authorises a
+         mutation — the same discipline `teardown.delete_flow` applies
+      3. the version actually exists in that flow's own version list
+
+    Layer 2 is why layer 1 is not sufficient on its own: layer 1
+    compares against `expected_flow_crn`, which comes from the state
+    file, so a state file carrying a colleague's flow CRN would satisfy
+    it. Layer 2 is what notices.
+
+    Returns the version record on success, so the caller gets the
+    version integer without a second read.
+    """
+
+    if not flow_version_crn:
+        raise NotAllowed(
+            "no flow-version CRN was supplied, so there is nothing to "
+            "validate and the version swap is refused."
+        )
+
+    if not expected_flow_crn:
+        raise NotAllowed(
+            "no flow CRN is recorded in the state file, so there is no "
+            "flow this prototype is allowed to deploy from. Run "
+            "`monitor_and_remediate.py --reconcile` first."
+        )
+
+    # --- 1: the version belongs to the flow we recorded ---------------
+    #
+    # A prefix test rather than a split, and the trailing separator is
+    # load-bearing: without it, a flow named `pdf-selfheal-oscillator-2`
+    # would be accepted as a version of `pdf-selfheal-oscillator`.
+    if not flow_version_crn.startswith(expected_flow_crn + "/"):
+        raise NotAllowed(
+            "the flow-version CRN does not belong to the flow recorded at "
+            "provisioning time, so it names someone else's flow.\n"
+            f"  version: {flow_version_crn}\n"
+            f"  flow:    {expected_flow_crn}"
+        )
+
+    # --- 2: that flow is really ours ----------------------------------
+    listing = df("list-flow-definitions", "--search-term", config.PREFIX)
+
+    if "error" in listing:
+        raise NotAllowed(
+            "could not list flow definitions to verify the flow is ours, "
+            f"so the version swap is refused: {listing.get('error')}"
+        )
+
+    ours = [
+        flow
+        for flow in (listing.get("flows") or [])
+        if isinstance(flow, dict) and flow.get("crn") == expected_flow_crn
+    ]
+
+    if not ours:
+        raise NotAllowed(
+            f"{expected_flow_crn} is not among the flows matching "
+            f"{config.PREFIX!r}, so it is not ours to deploy from."
+        )
+
+    name = ours[0].get("name") or ""
+
+    if not name.startswith(config.PREFIX):
+        raise NotAllowed(
+            f"the flow is named {name!r}, which does not carry the "
+            f"{config.PREFIX!r} prefix. The listing above was a server-side "
+            "substring search, so this local re-check is what actually "
+            "decides. Refusing."
+        )
+
+    # --- 3: the version exists in that flow ---------------------------
+    versions = df(
+        "list-flow-definition-versions",
+        "--flow-crn",
+        expected_flow_crn,
+    )
+
+    if "error" in versions:
+        raise NotAllowed(
+            "could not list the flow's versions to verify the target "
+            f"exists, so the version swap is refused: "
+            f"{versions.get('error')}"
+        )
+
+    matches = [
+        version
+        for version in (versions.get("flowVersions") or [])
+        if isinstance(version, dict)
+        and version.get("crn") == flow_version_crn
+    ]
+
+    if not matches:
+        known = sorted(
+            str(version.get("version"))
+            for version in (versions.get("flowVersions") or [])
+            if isinstance(version, dict)
+        )
+
+        raise NotAllowed(
+            f"{flow_version_crn} is not a version of {name!r}. That flow "
+            f"has versions {known}. Refusing to deploy a version the "
+            "catalog does not report."
+        )
+
+    return matches[0]
+
+
 # ---------------------------------------------------------------------
 # Mutating calls
 # ---------------------------------------------------------------------
@@ -618,18 +934,55 @@ def act(
     expected_crn: str,
     args: list,
     dry_run: bool = True,
+    plane: str = "dfworkload",
 ) -> dict:
     """
-    Perform a mutating `dfworkload` call, guardrail first.
+    Perform a mutating DataFlow call, guardrail first.
 
     The guardrail is applied here rather than at the call sites so that
     no mutation can bypass it, and `dry_run` is checked after it so that
     a dry run exercises the same check an armed run would.
 
+    `plane` selects which CLI surface the call goes to, and it exists
+    because not every mutation lives on the workload plane:
+
+      "dfworkload"  the default. Needs `--environment-crn`, which `dfw()`
+                    injects, and is served by a private `internal-*` ELB
+                    reachable only from inside the VPC.
+      "df"          the control plane, reachable from anywhere.
+                    `change-flow-version-in-deployment` lives here — it
+                    is a CLI *extension* that makes the workload hop
+                    internally — and it takes no `--environment-crn`,
+                    so passing one is an error rather than a harmless
+                    extra.
+
+    This used to hard-code `dfworkload` in three places, which is how
+    the two planes diverged: the argv echoed into the audit log was
+    assembled separately from the argv actually run, so a dry run could
+    report a command shape the armed path would not have used. Both now
+    come from `_argv()`.
+
     Returns a dict describing what happened, suitable for the audit log.
     It never contains a credential: `argv` is the argument list this
     module built, and credentials travel in the environment.
     """
+
+    if plane not in ("df", "dfworkload"):
+        raise ValueError(
+            f"plane must be 'df' or 'dfworkload', got {plane!r}"
+        )
+
+    def _argv():
+        """The exact command, so dry run and armed cannot disagree."""
+
+        if plane == "dfworkload":
+            return (
+                ["dfworkload"]
+                + list(args)
+                + ["--environment-crn", config.ENVIRONMENT_CRN]
+            )
+
+        return ["df"] + list(args)
 
     try:
         assert_action_allowed(deployment_crn, expected_crn)
@@ -639,6 +992,9 @@ def act(
             "performed": False,
             "refused": True,
             "reason": str(exc),
+            # The argv is reported on a refusal too, without the plane
+            # prefix it was never going to reach: what the caller needs
+            # from a refusal is which command was blocked.
             "argv": list(args),
         }
 
@@ -646,16 +1002,16 @@ def act(
         return {
             "performed": False,
             "dry_run": True,
-            "argv": ["dfworkload"] + list(args)
-            + ["--environment-crn", config.ENVIRONMENT_CRN],
+            "plane": plane,
+            "argv": _argv(),
         }
 
-    result = dfw(*args)
+    result = dfw(*args) if plane == "dfworkload" else df(*args)
 
     return {
         "performed": "error" not in result,
-        "argv": ["dfworkload"] + list(args)
-        + ["--environment-crn", config.ENVIRONMENT_CRN],
+        "plane": plane,
+        "argv": _argv(),
         "result": result,
     }
 
@@ -735,6 +1091,109 @@ def stop_then_start_flow(
         "performed": bool(stop.get("performed") and start.get("performed")),
         "dry_run": dry_run,
     }
+
+
+def change_flow_version(
+    deployment_crn: str,
+    expected_crn: str,
+    flow_version_crn: str,
+    expected_flow_crn: str,
+    strategy: str = "ONLY_RESTART_AFFECTED_COMPONENTS",
+    wait_minutes: int = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Swap the running flow to a different catalog version, in place.
+
+    This is the only mutation in this module that is a genuine *repair*
+    rather than a response: it changes what the flow does, instead of
+    restarting it and leaving the same backlog with the same behaviour.
+
+    **It is a control-plane call**, which is why `act()` needed a
+    `plane`. `cdp df change-flow-version-in-deployment` is a CLI
+    extension that makes the workload hop internally; the `dfworkload`
+    command of the same name is only that inner hop and takes no version
+    argument at all.
+
+    Two guardrails, not one, because this call takes two CRNs and the
+    existing guardrail only ever saw the first.
+
+    On `strategy`:
+
+      ONLY_RESTART_AFFECTED_COMPONENTS  the default here. Restarts just
+        the changed processor and leaves the backlog in place, which is
+        the only way the repair can be *proven*: the new drain rate is
+        measured against a queue that was not emptied for us.
+      STOP_AND_PROCESS_DATA  the API's own default, and the fallback if
+        the above turns out not to treat a concurrency change as
+        "affecting" a component.
+      STOP_AND_EMPTY_QUEUES  deliberately not used. It is the one call
+        in the whole df surface that truly drains a backlog, which makes
+        it tempting — and worthless here, because it improves the
+        monitored metric whether or not the repair did anything.
+
+    `--kpis` is omitted on purpose. The flag's own documentation says
+    that if KPIs are specified they *replace* all existing ones, so
+    omitting it is what preserves them — and a correct `componentId`
+    could not be supplied anyway, since it is not knowable before the
+    swap.
+    """
+
+    # `--wait-for-flow-to-stop-in-minutes` is valid *only* with the
+    # default STOP_AND_PROCESS_DATA strategy, and passing it alongside
+    # another raises DfExtensionError before any call is made. Caught
+    # here rather than by the CLI so the message says why.
+    if wait_minutes is not None and strategy != "STOP_AND_PROCESS_DATA":
+        return {
+            "performed": False,
+            "refused": True,
+            "reason": (
+                "--wait-for-flow-to-stop-in-minutes is only valid with the "
+                f"default STOP_AND_PROCESS_DATA strategy, not {strategy}."
+            ),
+            "argv": [],
+        }
+
+    try:
+        version = assert_flow_version_allowed(
+            flow_version_crn, expected_flow_crn
+        )
+
+    except NotAllowed as exc:
+        return {
+            "performed": False,
+            "refused": True,
+            "reason": str(exc),
+            "argv": [],
+        }
+
+    args = [
+        "change-flow-version-in-deployment",
+        "--deployment-crn",
+        deployment_crn,
+        "--flow-version-crn",
+        flow_version_crn,
+        "--strategy",
+        strategy,
+    ]
+
+    if wait_minutes is not None:
+        args += ["--wait-for-flow-to-stop-in-minutes", str(wait_minutes)]
+
+    result = act(
+        deployment_crn,
+        expected_crn,
+        args,
+        dry_run=dry_run,
+        plane="df",
+    )
+
+    # The target version, so the caller can assert afterwards that
+    # `flowVersion` actually became this integer rather than merely
+    # changing.
+    result["target_version"] = version.get("version")
+
+    return result
 
 
 ACTIONS = ("restart_deployment", "stop_then_start_flow")

@@ -246,6 +246,12 @@ if _bucket > MAX_SAMPLE_AGE_SECONDS:
         f"SELFHEAL_MAX_SAMPLE_AGE_SECONDS above {_bucket}."
     )
 
+# The drain rate deliberately has no window knob. It is measured over
+# whichever buckets in the response show the queue falling with work
+# still in it, which on this oscillation is two or three per cycle, and a
+# configurable window would only offer ways to include the trough and
+# bias the answer toward zero. See `queue_slope()` for the measurement.
+
 
 # ---------------------------------------------------------------------
 # The state machine
@@ -270,6 +276,37 @@ COOLDOWN_SECONDS = _int("SELFHEAL_COOLDOWN_SECONDS", 1800)
 # the action succeeded.
 VERIFY_DEADLINE_SECONDS = _int("SELFHEAL_VERIFY_DEADLINE_SECONDS", 1200)
 
+# ACTING and VERIFYING get their own clocks, and this is not tidiness.
+#
+# Once an action means "launch a workflow in another process", ACTING is
+# a weaker claim than it was: it says a run is in flight somewhere else,
+# not that this job is mid-call. The two states then ask different
+# questions — ACTING asks *has the run reached a terminal state*,
+# VERIFYING asks *has the world settled into a recognisable shape* — and
+# sharing one budget means a run that finishes in 90s gets only 1110s to
+# settle while a hung run eats the entire budget before anything is
+# observed at all.
+#
+# No extra bookkeeping is needed for either: `state.transition()`
+# restamps `since`, and `decide()` computes `elapsed` from it, so each
+# state gets its own clock for free.
+
+# An Agent Studio pass that has not finished in ten minutes is hung, not
+# slow. Matches the `timeout: 600` that `job/create_job.py` already sets
+# on the monitor job itself.
+ACTING_DEADLINE_SECONDS = _int("SELFHEAL_ACTING_DEADLINE_SECONDS", 600)
+
+# A launched run can take a little while to appear in a listing, so
+# "not found" is not evidence of failure immediately. After this it is,
+# and it means the launch reported success while nothing started —
+# which is a distinct failure from a run that started and failed.
+RUN_APPEAR_SECONDS = _int("SELFHEAL_RUN_APPEAR_SECONDS", 120)
+
+# How long the flow must be observed *unchanged* after a run finished
+# before concluding the agent changed nothing. Long enough that a
+# version swap still propagating is not mistaken for a no-op.
+NO_CHANGE_SETTLE_SECONDS = _int("SELFHEAL_NO_CHANGE_SETTLE_SECONDS", 180)
+
 # The circuit breaker. On exhaustion the job moves to the terminal
 # DISARMED state and a human has to clear it. This is what stops a
 # one-minute schedule plus a self-perpetuating breach from becoming a
@@ -282,6 +319,81 @@ ACTION_WINDOW_SECONDS = _int("SELFHEAL_ACTION_WINDOW_SECONDS", 86400)
 # counter, which keeps the audit log reproducible. "random" is the
 # random pick the prototype was originally described with.
 ACTION_SELECTION = _str("SELFHEAL_ACTION_SELECTION", "alternate")
+
+# Which family of remediation is in play.
+#
+#   "direct" — the two original actions, restart-deployment and
+#     stop/start-flow, chosen by `df_api.choose_action()`. Neither repairs
+#     anything: both stop the drain along with the generator, and the one
+#     measured restart left the queue higher than it found it. This path
+#     is kept because it is the only one with a measured result written
+#     down in `README.md`.
+#
+#   "agent" — hand the incident to an Agent Studio workflow, which reads
+#     the flow definition, proposes a bounded edit and swaps the version.
+#
+# These are separate families rather than three entries in one list on
+# purpose: `choose_action()` alternates between whatever it is given, and
+# a loop that alternates between "restart the deployment" and "ask an
+# agent to reason about it" is incoherent.
+ACTION_MODE = _str("SELFHEAL_ACTION_MODE", "agent")
+
+ACTION_MODES = ("agent", "direct")
+
+if ACTION_MODE not in ACTION_MODES:
+    raise SystemExit(
+        f"error: SELFHEAL_ACTION_MODE={ACTION_MODE!r} is not one of "
+        f"{list(ACTION_MODES)}."
+    )
+
+
+# ---------------------------------------------------------------------
+# Handing an incident to the Agent Studio workflow
+# ---------------------------------------------------------------------
+
+# How the job launches the workflow. Allow-list validated at import for
+# the same reason the metrics window is: a typo here must not leave a
+# monitor running that looks healthy and can never act.
+#
+#   "record_only"         the default, and it works today. Writes the
+#                         incident to a ledger and returns
+#                         performed: False. The whole loop is then
+#                         testable end to end with no Agent Studio
+#                         dependency at all, which matters because
+#                         whether Agent Studio can be launched
+#                         programmatically is still unverified.
+#   "cml_model_endpoint"  POST the incident to a deployed workflow's
+#                         JSON endpoint. Only if a Deploy action yields
+#                         a CML Model with an access key.
+#   "cml_job_run"         cmlapi.create_job_run against a thin job that
+#                         invokes the workflow. Only if there is no
+#                         endpoint.
+#
+# Keeping the default at the one that cannot fail is deliberate: a
+# monitor that detects correctly and records honestly is useful, and is
+# also exactly the fallback if no programmatic launch exists.
+TRIGGER_BACKEND = _str("SELFHEAL_TRIGGER_BACKEND", "record_only")
+
+TRIGGER_BACKENDS = ("record_only", "cml_model_endpoint", "cml_job_run")
+
+if TRIGGER_BACKEND not in TRIGGER_BACKENDS:
+    raise SystemExit(
+        f"error: SELFHEAL_TRIGGER_BACKEND={TRIGGER_BACKEND!r} is not one of "
+        f"{list(TRIGGER_BACKENDS)}."
+    )
+
+# Target of the launch, per backend. Both are empty by default, and
+# `trigger.launch()` refuses rather than guesses when the one its backend
+# needs is missing — an unconfigured launch must fail loudly, because the
+# alternative is a job that reports acting and does nothing.
+TRIGGER_ENDPOINT_URL = _str("SELFHEAL_TRIGGER_ENDPOINT_URL", "")
+
+TRIGGER_JOB_ID = _str("SELFHEAL_TRIGGER_JOB_ID", "")
+
+# The launch request itself, not the workflow run. A launch is a single
+# HTTP call; if it has not returned in 30s the workflow is not going to
+# be started by waiting longer, and the cron fires again in a minute.
+TRIGGER_TIMEOUT_SECONDS = _int("SELFHEAL_TRIGGER_TIMEOUT_SECONDS", 30)
 
 
 # ---------------------------------------------------------------------
@@ -338,6 +450,13 @@ STATE_DIR = _str(
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 
 LOCK_FILE = os.path.join(STATE_DIR, "lock")
+
+# One file per incident, created with O_EXCL so the filesystem itself
+# refuses a second launch for an incident id that has already been
+# handed over. This is the idempotency ledger, and it is a directory of
+# small files rather than a key in the state file because it must survive
+# the state file being reconciled, reset, or hand-edited.
+INCIDENT_DIR = os.path.join(STATE_DIR, "incidents")
 
 FLOW_DEFINITION_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),

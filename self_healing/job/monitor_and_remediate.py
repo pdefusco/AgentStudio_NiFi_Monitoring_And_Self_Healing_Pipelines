@@ -64,6 +64,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import df_api
 import state
+import trigger
 
 
 # A millisecond epoch for any date this code could plausibly run in is
@@ -161,6 +162,147 @@ def latest_sample(chart: dict, ignore_before: float = None) -> dict:
     return result
 
 
+def queue_slope(chart: dict, ignore_before: float = None) -> dict:
+    """
+    How fast the queue drains, in flowfiles per second, negative.
+
+    This is the number that decides whether a repair worked, so how it is
+    computed matters more than usual.
+
+    **It takes a chart object, not a CRN, and that signature is the
+    enforcement.** A KPI chart divides the requested window into exactly
+    25 buckets anchored to *request time*, so two responses sit on two
+    different grids and differencing across them is wrong — measured at
+    ~20% error in this repo's own notes. Accepting an already-fetched
+    chart means there is no code path by which this function could issue a
+    second call and make that mistake. It reads the same `metrics.datas`
+    list and applies the same `ignore_before` cut as `latest_sample()`, so
+    the rate and the depth always describe one response and one
+    pre-action filter.
+
+    **Why this is a conditional statistic and not a fit over the last N
+    points.** Measured live, one 600s cycle of the oscillator is eight
+    75s buckets and its per-bucket rates are:
+
+        -2.00  -1.97  -1.36  0.00  0.00  0.00  +7.33
+
+    The drain is three buckets wide, the floor is three, and the burst is
+    one. Any fixed window of more than about two points therefore
+    straddles phases, and a line fitted across a V reports a rate near
+    zero for a queue that is draining perfectly well. A six-point fit on
+    this series measured +0.853 while the queue was refilling — directionally
+    right about that instant and useless as an acceptance criterion.
+
+    So select the buckets that describe draining and ignore the rest:
+
+    - **falling** — `value` decreased across the pair. Rising and flat
+      buckets are a different regime, not noise to be averaged in.
+    - **still had work at the end** — the later value is above zero. The
+      `-1.36` bucket above is the queue reaching empty partway through, so
+      the drain idles for the remainder and the bucket understates the
+      rate by whatever fraction it sat idle. Including it biases every
+      measurement toward zero, and biases it *more* as the drain gets
+      faster, which is precisely the wrong direction for judging a repair
+      that makes the drain faster.
+
+    The median of what survives, because one straddling bucket should not
+    move the answer. On the baseline series this selects exactly
+    `[-2.00, -1.97]` and returns **-1.985**, reproducing the hand-derived
+    -1.99 rather than approximating it.
+
+    `pairs` is returned alongside, and a caller judging a repair should
+    read it: at concurrency 4 a cycle yields only about one qualifying
+    bucket, so a verdict may be resting on a single measurement.
+
+    Returns a `status` of ok / no_chart / no_data / no_drain_observed.
+    """
+
+    if not chart:
+        return {"status": "no_chart"}
+
+    points = [
+        p
+        for p in ((chart.get("metrics") or {}).get("datas") or [])
+        if isinstance(p.get("timestamp"), (int, float))
+        and p["timestamp"] >= MIN_PLAUSIBLE_MS
+        and isinstance(p.get("value"), (int, float))
+    ]
+
+    available = len(points)
+
+    if ignore_before:
+        points = [p for p in points if p["timestamp"] / 1000.0 > ignore_before]
+
+    if len(points) < 2:
+        # Two causes, and they want opposite responses from a reader, so
+        # they get different names. A chart that genuinely carries no
+        # data is a problem; a chart whose buckets were all discarded as
+        # pre-action is this filter working exactly as intended.
+        #
+        # Measured 2026-10-05: for roughly two buckets after an action
+        # the rate is legitimately unknowable, because every bucket that
+        # straddles the change has been thrown away on purpose. Reporting
+        # that as `no_data` invites someone to go looking for a broken
+        # KPI. The wait is bounded and worth stating, since the question
+        # being asked is "when will I have a number".
+        if ignore_before and available >= 2:
+            buckets = config.BUCKET_SECONDS_BY_PERIOD[config.METRICS_TIME_PERIOD]
+
+            return {
+                "status": "awaiting_post_action_buckets",
+                "points": len(points),
+                "discarded": available - len(points),
+                "measurable_in_seconds": max(
+                    0, int(ignore_before + 2 * buckets - time.time())
+                ),
+            }
+
+        return {"status": "no_data", "points": len(points)}
+
+    rates = []
+
+    for earlier, later in zip(points, points[1:]):
+        seconds = (later["timestamp"] - earlier["timestamp"]) / 1000.0
+
+        if seconds <= 0:
+            continue
+
+        drained = float(earlier["value"]) - float(later["value"])
+
+        if drained <= 0 or float(later["value"]) <= 0:
+            continue
+
+        rates.append(-drained / seconds)
+
+    if not rates:
+        return {
+            "status": "no_drain_observed",
+            "points": len(points),
+            "pairs": 0,
+        }
+
+    rates.sort()
+    middle = len(rates) // 2
+
+    median = (
+        rates[middle]
+        if len(rates) % 2
+        else (rates[middle - 1] + rates[middle]) / 2.0
+    )
+
+    return {
+        "status": "ok",
+        "per_second": round(median, 3),
+        "pairs": len(rates),
+        "points": len(points),
+        "steepest": round(rates[0], 3),
+        "shallowest": round(rates[-1], 3),
+        "window_seconds": round(
+            (points[-1]["timestamp"] - points[0]["timestamp"]) / 1000.0, 1
+        ),
+    }
+
+
 def observe(current: dict) -> dict:
     """
     Read the metric charts and derive the breach verdict.
@@ -194,7 +336,19 @@ def observe(current: dict) -> dict:
         {},
     )
 
-    sample = latest_sample(chart, current.get("last_action_started_at"))
+    # The later of the two action clocks. `last_action_started_at` is when
+    # the action was *requested*; `incident_applied_at` is when the flow
+    # change was first observed, which is later and is the point after
+    # which the series describes the repaired flow. Taking the max keeps
+    # the filter conservative, so neither a sample nor a slope can be
+    # computed from a bucket that straddles the change. Both are read with
+    # `or 0` because a fresh state file has neither.
+    ignore_before = max(
+        current.get("last_action_started_at") or 0,
+        current.get("incident_applied_at") or 0,
+    )
+
+    sample = latest_sample(chart, ignore_before)
 
     observation = {
         "chart_sources": merged["sources"],
@@ -202,6 +356,11 @@ def observe(current: dict) -> dict:
         "chart_found": bool(chart),
         "chart_name": chart.get("name"),
         "sample": sample,
+        # Computed on every run, and recorded above the verdict branch on
+        # purpose: a trend is only reviewable after the fact if it was
+        # logged all along, and the runs where the sample is unusable are
+        # exactly the ones where the trend explains why.
+        "slope": queue_slope(chart, ignore_before),
         "threshold": config.QUEUE_THRESHOLD,
     }
 
@@ -330,13 +489,319 @@ def gather_context(current: dict) -> dict:
 # Decision
 # ---------------------------------------------------------------------
 
-def decide(current: dict, observation: dict, deployment_state: str) -> dict:
+def decide_acting_agent(current: dict, elapsed: float, run: dict) -> dict:
+    """
+    ACTING, when the action was handing the incident to the workflow.
+
+    ACTING now makes a weaker claim than it used to. For the two direct
+    remediations it meant "this job is mid-call"; here it means "a run is
+    in flight **in another process**", which this job can only ask about.
+    So the question is narrow: has that run reached a terminal state?
+    Whether the *repair* worked is not asked here at all — that is
+    VERIFYING's job, and it is answered against the deployment rather
+    than against the run.
+
+    Two failure modes are separated deliberately, because they need
+    different human responses:
+
+      - the launch reported success and **no run ever appeared**, which
+        points at the trigger or at Agent Studio;
+      - a run appeared and **hung**, which points at the workflow.
+
+    A run this cannot interrogate (`unknown`) is never read as success.
+    It simply waits, and `ACTING_DEADLINE_SECONDS` is what resolves it.
+    """
+
+    status = (run or {}).get("status") or "unknown"
+    detail = (run or {}).get("detail") or ""
+
+    fields = {
+        "run_state": status,
+        "run_last_polled_at": time.time(),
+    }
+
+    if status == "not_found":
+        if elapsed > config.RUN_APPEAR_SECONDS:
+            return {
+                "act": False,
+                "to_state": state.ESCALATED,
+                "reason": (
+                    f"the launch reported success {int(elapsed)}s ago but no "
+                    f"run has appeared, past the "
+                    f"{config.RUN_APPEAR_SECONDS}s grace period. The workflow "
+                    "was never started, so nothing is in flight and nothing "
+                    "was repaired. Escalating rather than relaunching."
+                ),
+                "fields": dict(fields, verify_verdict="RUN_NEVER_STARTED"),
+            }
+
+        return {
+            "act": False,
+            "to_state": None,
+            "reason": (
+                f"a run was launched {int(elapsed)}s ago and has not appeared "
+                f"in a listing yet; allowing "
+                f"{config.RUN_APPEAR_SECONDS}s for it to show up."
+            ),
+            "fields": fields,
+        }
+
+    if (run or {}).get("terminal"):
+        return {
+            "act": False,
+            "to_state": state.VERIFYING,
+            "reason": (
+                f"the run finished ({status}: {detail}). Verifying the "
+                "deployment to find out whether anything actually changed — "
+                "a run that succeeded is not evidence that the flow was "
+                "repaired."
+            ),
+            "fields": fields,
+        }
+
+    if elapsed > config.ACTING_DEADLINE_SECONDS:
+        return {
+            "act": False,
+            "to_state": state.ESCALATED,
+            "reason": (
+                f"the run has been {status} for {int(elapsed)}s, past the "
+                f"{config.ACTING_DEADLINE_SECONDS}s deadline. An Agent Studio "
+                "pass that has not finished in that time is hung, not slow. "
+                "Escalating; the run may still be holding a half-applied "
+                "change, so check it before clearing."
+            ),
+            "fields": dict(fields, verify_verdict="RUN_HUNG"),
+        }
+
+    return {
+        "act": False,
+        "to_state": None,
+        "reason": (
+            f"a run is in flight ({status}), {int(elapsed)}s of "
+            f"{config.ACTING_DEADLINE_SECONDS}s elapsed."
+        ),
+        "fields": fields,
+    }
+
+
+def decide_verifying_agent(
+    current: dict,
+    observation: dict,
+    deployment_state: str,
+    flow: dict,
+    elapsed: float,
+) -> dict:
+    """
+    VERIFYING, when the action was handing the incident to the workflow.
+
+    **The job never concludes a repair happened because the agent said
+    so.** The agent writes a report; this function confirms or refutes it
+    against the API, and every check below is a control-plane read.
+
+    The checks are ordered, and the order is the design. The two that
+    escalate come first, because both describe a world in which carrying
+    on would be actively harmful:
+
+      1. **HALF_APPLIED** — the deployed flow is advertising
+         `RETRY_CHANGE_FLOW_VERSION` or `CANCEL_CHANGE_FLOW_VERSION`.
+         That is the API volunteering that it is half-done, which it can
+         only do because the control plane mutates before the workload
+         hop. Never retried automatically: this is a shared tenant.
+
+      2. **BLINDED** — the monitor could see its queue before and cannot
+         now. `ChangeFlowVersionInDeploymentRequest` accepts a `kpis`
+         array with the same whole-array replace semantics already banned
+         on `update-deployment`, so a version change that does not
+         re-supply the connection KPI erases the monitor's own eyes. The
+         symptom is silent: `no_chart`, then `UNKNOWN` forever, while the
+         job looks like it is running fine. It escalates rather than
+         cools because cooling a blind monitor for thirty minutes is the
+         worst available outcome.
+
+    Only then the ordinary outcomes. `flow_version` is an `int32`, so
+    `after > before` is a monotonic, non-negotiable fact that nothing the
+    agent reports can influence — which is exactly why it, and not the
+    agent's prose, is the signal.
+
+    Note what is deliberately *not* here: whether the queue drained.
+    Success is a steeper drain rate measured on a queue that was not
+    emptied for us, and that comparison needs post-change buckets which
+    do not exist yet at this point. This function establishes that the
+    change landed and the monitor survived; the drain rate is recorded on
+    every run into the audit log and is read there.
+    """
+
+    facts = flow or {}
+    before = current.get("flow_version_before")
+    after = facts.get("flow_version")
+
+    fields = {"flow_version_after": after}
+
+    if df_api.is_half_applied(facts):
+        return {
+            "act": False,
+            "to_state": state.ESCALATED,
+            "reason": (
+                "the deployed flow is advertising "
+                f"{sorted(df_api.HALF_APPLIED_ACTIONS & set(facts.get('valid_actions') or []))}, "
+                "which means the version change is half-applied between the "
+                "control plane and the workload plane. Escalating and leaving "
+                "it alone: retrying or cancelling a dangling change on a "
+                "shared tenant is a human's decision."
+            ),
+            "fields": dict(fields, verify_verdict="HALF_APPLIED"),
+        }
+
+    if current.get("chart_present_before") and not observation.get("chart_found"):
+        return {
+            "act": False,
+            "to_state": state.ESCALATED,
+            "reason": (
+                f"the {config.CONNECTION_NAME!r} chart was present before the "
+                "action and is gone now, so the monitor can no longer see the "
+                "queue it exists to watch. A version change that does not "
+                "re-supply the KPI replaces the whole array. Escalating "
+                "rather than cooling: a blind monitor that reports health is "
+                "worse than one that stops."
+            ),
+            "fields": dict(fields, verify_verdict="BLINDED"),
+        }
+
+    # A version swap in flight shows on the *deployed flow*, not on the
+    # deployment: DeploymentState carries CHANGING_FLOW_VERSION among its
+    # x-deprecated-enum-values, so deployment state is not a usable
+    # in-flight signal for this operation.
+    flow_state = facts.get("state") or ""
+    flow_steady = flow_state in df_api.STEADY_STATES
+
+    if isinstance(after, int) and isinstance(before, int) and after > before:
+        if deployment_state in df_api.STEADY_STATES and flow_steady:
+            return {
+                "act": False,
+                "to_state": state.COOLING,
+                "reason": (
+                    f"the flow version moved v.{before} -> v.{after}, the "
+                    f"deployment is {deployment_state} and the deployed flow "
+                    f"is {flow_state}. The change landed. Whether it was the "
+                    "right change is answered by the drain rate in the audit "
+                    f"log, not here. Cooling for {config.COOLDOWN_SECONDS}s."
+                ),
+                "fields": dict(
+                    fields,
+                    verify_verdict="APPLIED",
+                    incident_applied_at=time.time(),
+                ),
+            }
+
+        if elapsed > config.VERIFY_DEADLINE_SECONDS:
+            return {
+                "act": False,
+                "to_state": state.ESCALATED,
+                "reason": (
+                    f"the flow version moved v.{before} -> v.{after} but the "
+                    f"deployment is {deployment_state} and the flow is "
+                    f"{flow_state or 'unknown'} after {int(elapsed)}s, past "
+                    f"the {config.VERIFY_DEADLINE_SECONDS}s deadline. The "
+                    "repair is not lost, only unconfirmed."
+                ),
+                "fields": dict(fields, verify_verdict="APPLIED_NOT_STEADY"),
+            }
+
+        return {
+            "act": False,
+            "to_state": None,
+            "reason": (
+                f"the flow version moved v.{before} -> v.{after}; waiting for "
+                f"a steady state (deployment {deployment_state}, flow "
+                f"{flow_state or 'unknown'}), {int(elapsed)}s elapsed."
+            ),
+            "fields": fields,
+        }
+
+    # The version did not move. `updated` separates "nothing happened"
+    # from "something was changed without bumping the version", and those
+    # deserve different answers: the first is a legitimate outcome, the
+    # second is a flow in a state this loop did not author.
+    updated_before = current.get("flow_updated_before")
+    updated_now = facts.get("updated")
+
+    mutated_without_version = (
+        updated_before is not None
+        and updated_now is not None
+        and updated_now != updated_before
+    )
+
+    if mutated_without_version and elapsed > config.VERIFY_DEADLINE_SECONDS:
+        return {
+            "act": False,
+            "to_state": state.ESCALATED,
+            "reason": (
+                f"the flow version is still v.{after} but the deployment's "
+                f"`updated` timestamp changed ({updated_before} -> "
+                f"{updated_now}), so something was modified without a version "
+                "bump. Escalating: that is not a change this loop made and "
+                "not one it can verify."
+            ),
+            "fields": dict(fields, verify_verdict="MUTATED_WITHOUT_VERSION"),
+        }
+
+    if not mutated_without_version and elapsed > config.NO_CHANGE_SETTLE_SECONDS:
+        return {
+            "act": False,
+            "to_state": state.COOLING,
+            "reason": (
+                f"the run finished and the flow is unchanged at v.{after} "
+                f"after {int(elapsed)}s. The agent proposed nothing, or "
+                "declined to act, which is a valid outcome and not a failure. "
+                f"Cooling for {config.COOLDOWN_SECONDS}s; the agent's own "
+                "reason is in the incident ledger."
+            ),
+            "fields": dict(fields, verify_verdict="NO_CHANGE"),
+        }
+
+    if elapsed > config.VERIFY_DEADLINE_SECONDS:
+        return {
+            "act": False,
+            "to_state": state.ESCALATED,
+            "reason": (
+                f"no recognisable outcome after {int(elapsed)}s, past the "
+                f"{config.VERIFY_DEADLINE_SECONDS}s deadline: version still "
+                f"v.{after}, deployment {deployment_state}, flow "
+                f"{flow_state or 'unknown'}. Escalating rather than guessing."
+            ),
+            "fields": dict(fields, verify_verdict="UNRESOLVED"),
+        }
+
+    return {
+        "act": False,
+        "to_state": None,
+        "reason": (
+            f"verifying: version still v.{after}, deployment "
+            f"{deployment_state}, flow {flow_state or 'unknown'}, "
+            f"{int(elapsed)}s elapsed "
+            f"(settle at {config.NO_CHANGE_SETTLE_SECONDS}s)."
+        ),
+        "fields": fields,
+    }
+
+
+def decide(
+    current: dict,
+    observation: dict,
+    deployment_state: str,
+    flow: dict = None,
+    run: dict = None,
+) -> dict:
     """
     Advance the state machine and say whether to act.
 
     Returns {"act": bool, "to_state": str or None, "reason": str, ...}.
     This function performs no I/O and mutates nothing, so the whole
-    decision table is testable without touching the account.
+    decision table is testable without touching the account. `flow` and
+    `run` are passed in rather than fetched for exactly that reason:
+    verifying an agent action needs the deployed flow's facts and the
+    launched run's status, and reading them here would make the decision
+    table untestable offline.
 
     The ordering matters. Terminal and safety checks come first, so no
     amount of breach evidence can act while the breaker is tripped or the
@@ -380,11 +845,21 @@ def decide(current: dict, observation: dict, deployment_state: str) -> dict:
             ),
         }
 
-    # An action was requested by a previous run that then died before it
-    # could record the outcome. Treat it as in flight rather than
-    # retrying, which is what makes the ACTING write-before-act ordering
-    # worth having.
+    # Which family of action is in flight decides how it is verified, and
+    # that is read from what was actually done rather than from
+    # `config.ACTION_MODE`. Flipping the mode between the launch and the
+    # next cron tick must not change how an in-flight action is judged.
+    agent_action = (current.get("last_action") or "") == trigger.ACTION
+
     if machine == state.ACTING:
+        if agent_action:
+            return decide_acting_agent(current, elapsed, run)
+
+        # The direct actions are synchronous `cdp` calls, so reaching a
+        # second run while still ACTING means the previous run died
+        # before recording the outcome. Treat it as in flight rather than
+        # retrying, which is what makes the write-before-act ordering
+        # worth having.
         return {
             "act": False,
             "to_state": state.VERIFYING,
@@ -395,6 +870,11 @@ def decide(current: dict, observation: dict, deployment_state: str) -> dict:
         }
 
     if machine == state.VERIFYING:
+        if agent_action:
+            return decide_verifying_agent(
+                current, observation, deployment_state, flow, elapsed
+            )
+
         if deployment_state in df_api.STEADY_STATES:
             # Unconditional, and this is the crux: the queue is still
             # above threshold here and always will be, because the action
@@ -534,17 +1014,25 @@ def decide(current: dict, observation: dict, deployment_state: str) -> dict:
 # Action
 # ---------------------------------------------------------------------
 
-def perform(current: dict, action: str, armed: bool) -> dict:
+def perform(current: dict, action: str, armed: bool, incident: dict = None) -> dict:
     """
     Carry out one remediation.
 
     The guardrail is not applied here: it lives inside `df_api.act`, so
     there is no path to a mutation that skips it.
+
+    The agent action is dispatched first and mutates nothing itself — it
+    hands an incident to a workflow, and the mutation happens inside that
+    workflow's own gated tool. Its guardrail is `trigger`'s ledger and
+    the validation of the payload.
     """
 
     deployment_crn = current.get("deployment_crn") or ""
     flow_crn = current.get("deployed_flow_crn") or ""
     expected = current.get("deployment_crn") or ""
+
+    if action == trigger.ACTION:
+        return trigger.launch(incident or {}, dry_run=not armed)
 
     if action == "stop_then_start_flow":
         return df_api.stop_then_start_flow(
@@ -602,10 +1090,22 @@ def show_status(current: dict) -> None:
 
     print(f"state file: {config.STATE_FILE}\n")
 
+    # Every epoch-seconds key, rendered as a timestamp plus an age. The
+    # age is the half that gets read: the question asked of this output
+    # is "has the run been in flight too long", and answering it from a
+    # raw float means doing the subtraction by hand.
+    stamped = (
+        "since",
+        "last_action_started_at",
+        "incident_launched_at",
+        "incident_applied_at",
+        "run_last_polled_at",
+    )
+
     for key in sorted(current):
         value = current[key]
 
-        if key in ("since", "last_action_started_at") and value:
+        if key in stamped and value:
             stamp = datetime.datetime.fromtimestamp(
                 value, datetime.timezone.utc
             ).isoformat()
@@ -626,6 +1126,130 @@ def show_status(current: dict) -> None:
     print(f"  audit log: {audit_path()}")
 
 
+def reconcile() -> int:
+    """
+    Rewrite the state file's CRNs from the live deployment.
+
+    The state file is what the guardrail compares every mutation target
+    against, so it drifts in two directions and both matter. An empty
+    `deployment_crn` refuses *every* action, which disarms the loop by
+    accident rather than by choice. A stale `flow_version_crn` points at
+    a version that is no longer deployed.
+
+    This writes nothing to CDF. But it writes the one file that decides
+    what may be mutated, so it applies the same discipline as teardown
+    before trusting a name: the listing is filtered by prefix
+    server-side, and then the match is re-checked locally, because that
+    filter is a substring search and this value ends up authorising
+    mutations. A reconcile that wrote a colleague's CRN into the state
+    file would arm the loop against their deployment.
+    """
+
+    print(f"reconciling {config.STATE_FILE}")
+    print(f"  looking for a deployment named {config.DEPLOYMENT_NAME!r}\n")
+
+    listing = df_api.require(
+        df_api.df(
+            "list-deployments",
+            "--search-term",
+            config.PREFIX,
+        ),
+        "could not list deployments",
+    )
+
+    matches = [
+        d
+        for d in (listing.get("deployments") or [])
+        if d.get("name") == config.DEPLOYMENT_NAME
+    ]
+
+    if not matches:
+        sys.exit(
+            f"error: no deployment named {config.DEPLOYMENT_NAME!r} exists.\n"
+            "  Run the provisioning scripts, or set SELFHEAL_PREFIX to match "
+            "an existing one."
+        )
+
+    if len(matches) > 1:
+        sys.exit(
+            f"error: {len(matches)} deployments are named "
+            f"{config.DEPLOYMENT_NAME!r}.\n"
+            "  Refusing to guess which one the loop may act on. Remove the "
+            "duplicate in the CDF UI first."
+        )
+
+    deployment = matches[0]
+    deployment_crn = deployment.get("crn") or ""
+
+    # Belt and braces, exactly as teardown.delete_flow does it: the
+    # listing was already prefix-filtered, but that filter is a
+    # server-side substring search and this CRN is about to become the
+    # one value that authorises mutations.
+    if not (deployment.get("name") or "").startswith(config.PREFIX):
+        sys.exit(
+            f"error: {deployment.get('name')!r} does not carry the "
+            f"{config.PREFIX!r} prefix. Refusing to record it."
+        )
+
+    if deployment_crn in config.DENYLIST_DEPLOYMENT_CRNS:
+        sys.exit(
+            "error: that deployment is on the denylist and must never be "
+            "recorded as this loop's target."
+        )
+
+    facts = df_api.deployment_facts(deployment_crn)
+
+    if facts.get("error"):
+        sys.exit(f"error: could not read the deployment: {facts['error']}")
+
+    flow_crn = df_api.deployed_flow_crn(deployment_crn)
+
+    if not flow_crn:
+        print(
+            "  warning: the deployment has no deployed flow yet, so "
+            "deployed_flow_crn stays empty.\n"
+            "  Flow-scoped reads and actions will be unavailable until it "
+            "does.\n"
+        )
+
+    current = state.read()
+
+    updates = {
+        "deployment_crn": deployment_crn,
+        "deployed_flow_crn": flow_crn,
+        "flow_crn": facts.get("flow_crn") or current.get("flow_crn") or "",
+        "flow_version_crn": facts.get("flow_version_crn") or "",
+    }
+
+    changed = False
+
+    for key in sorted(updates):
+        was = current.get(key)
+        now = updates[key]
+
+        if was == now:
+            print(f"  {key}: unchanged")
+
+        else:
+            print(f"  {key}:\n      was: {was}\n      now: {now}")
+            current[key] = now
+            changed = True
+
+    print(f"\n  live flow version: v.{facts.get('flow_version')}")
+    print(f"  deployment state:  {facts.get('state')}")
+
+    if not changed:
+        print("\nnothing to do: the state file already matches the account.")
+
+        return 0
+
+    state.write(current)
+
+    print(f"\nwritten. Confirm with:\n  python {sys.argv[0]} --status")
+
+    return 0
+
+
 def run_once(args) -> int:
     """Execute one observe/decide/act pass."""
 
@@ -641,9 +1265,31 @@ def run_once(args) -> int:
     started = time.time()
     machine_before = current.get("state")
 
-    deployment_state = df_api.deployment_state(current["deployment_crn"])
+    # One call, both uses. `describe-deployment` already carries the flow
+    # version, its CRN and `updated`; `deployment_state()` used to read
+    # that response and throw all of it away. The before-fingerprint is
+    # therefore free rather than an extra API call per minute.
+    deployment = df_api.deployment_facts(current["deployment_crn"])
+    deployment_state = deployment.get("state")
+
     observation = observe(current)
-    decision = decide(current, observation, deployment_state)
+
+    # Fetched only in the two states that need them, so the common idle
+    # tick still costs exactly the reads it did before. `decide()` stays
+    # pure: it receives these rather than fetching them, which is what
+    # keeps the whole decision table testable offline.
+    flow = None
+    run = None
+
+    if current.get("state") in (state.ACTING, state.VERIFYING):
+        if (current.get("last_action") or "") == trigger.ACTION:
+            flow = df_api.flow_facts(
+                current["deployment_crn"],
+                current.get("deployed_flow_crn") or "",
+            )
+            run = trigger.status(current.get("run_ref") or "")
+
+    decision = decide(current, observation, deployment_state, flow, run)
 
     print(f"deployment state: {deployment_state}")
     print(f"machine state:    {current.get('state')}")
@@ -676,44 +1322,134 @@ def run_once(args) -> int:
     else:
         print(f"sample:           {sample.get('status')}")
 
+    slope = observation.get("slope") or {}
+
+    if slope.get("status") == "ok":
+        print(
+            f"drain rate:       {slope['per_second']:+} files/s "
+            f"(median of {slope['pairs']} draining bucket(s), "
+            f"{slope['steepest']} to {slope['shallowest']})"
+        )
+
+    elif slope.get("status") == "awaiting_post_action_buckets":
+        print(
+            f"drain rate:       not yet measurable — "
+            f"{slope['discarded']} pre-action bucket(s) discarded, "
+            f"~{slope['measurable_in_seconds']}s until two post-action "
+            "buckets exist"
+        )
+
+    else:
+        print(f"drain rate:       {slope.get('status')}")
+
     print(f"verdict:          {observation['verdict']}")
     print(f"decision:         {decision['reason']}")
 
     performed = None
     action_name = None
+    incident = None
 
     if decision["act"]:
-        action_name = args.action or df_api.choose_action(
-            int(current.get("action_count") or 0)
-        )
+        if args.action:
+            action_name = args.action
+
+        elif config.ACTION_MODE == "agent":
+            action_name = trigger.ACTION
+
+        else:
+            action_name = df_api.choose_action(
+                int(current.get("action_count") or 0)
+            )
+
+        acting_fields = {
+            "consecutive_breaches": decision.get(
+                "consecutive_breaches", current.get("consecutive_breaches")
+            ),
+            "last_action_started_at": time.time(),
+            # Recorded here so VERIFYING reads the family that actually
+            # acted rather than whatever config says on a later tick.
+            "last_action": action_name,
+        }
+
+        if action_name == trigger.ACTION:
+            # Built from the state as it is about to be written, not as
+            # it was read. `decide()` returns the *incremented* breach
+            # count in its decision and leaves `current` holding the
+            # pre-increment value, so building the incident from
+            # `current` alone sent the agent `breach_count: 1` on the
+            # same tick whose own reason line said "2 consecutive fresh
+            # breaches". Measured 2026-10-05 on a live breach.
+            #
+            # That matters because `breach_count` exists for exactly one
+            # purpose — letting the agent judge severity — and an
+            # off-by-one understates it at precisely the moment the
+            # threshold to act was crossed.
+            incident = trigger.build_incident(
+                {**current, **acting_fields}, observation
+            )
+
+            # The before-fingerprint, captured from the call already made
+            # above. Without it, "the version moved" has nothing to be
+            # compared against and BLINDED cannot be distinguished from a
+            # KPI that was never there.
+            acting_fields.update(
+                {
+                    "incident_id": incident["incident_id"],
+                    "incident_count": int(current.get("incident_count") or 0) + 1,
+                    "incident_launch_attempts": 1,
+                    "incident_launched_at": time.time(),
+                    "incident_applied_at": None,
+                    "trigger_backend": config.TRIGGER_BACKEND,
+                    "run_ref": None,
+                    "run_state": None,
+                    "verify_verdict": None,
+                    "flow_version_after": None,
+                    "flow_version_before": deployment.get("flow_version"),
+                    "flow_version_crn_before": deployment.get("flow_version_crn"),
+                    "flow_updated_before": deployment.get("updated"),
+                    "chart_present_before": bool(observation.get("chart_found")),
+                    "credential_source": trigger.credential_source(),
+                }
+            )
 
         # ACTING is written *before* the request, so a run that overlaps
         # an action in flight reads ACTING instead of IDLE. Doing this
         # after would leave a window in which two runs both act.
         if args.arm:
-            current = state.transition(
-                current,
-                state.ACTING,
-                consecutive_breaches=decision.get(
-                    "consecutive_breaches", current.get("consecutive_breaches")
-                ),
-                last_action_started_at=time.time(),
-            )
+            current = state.transition(current, state.ACTING, **acting_fields)
 
         print(f"action:           {action_name} (armed={bool(args.arm)})")
 
-        performed = perform(current, action_name, bool(args.arm))
+        if incident is not None:
+            print(f"  incident:       {incident['incident_id']}")
+            print(
+                f"  payload:        queue={incident['queue_depth']} "
+                f"drain={incident['drain_rate']}/s "
+                f"({incident['drain_rate_pairs']} buckets) "
+                f"breaches={incident['breach_count']}"
+            )
+
+        performed = perform(current, action_name, bool(args.arm), incident)
 
         if performed.get("refused"):
             print(f"  REFUSED: {performed.get('reason')}")
 
-        elif args.arm and not performed.get("performed"):
-            print("  the action failed; see the audit log.")
-
-        elif args.arm:
+        elif args.arm and performed.get("performed"):
             print("  requested.")
 
             current = state.record_action(current, action_name)
+
+        elif args.arm and performed.get("run_ref"):
+            # Accepted but not launched, which is what `record_only`
+            # does by design. Reporting this as a failure would be a lie
+            # in the one direction that matters: the incident was
+            # produced correctly and is on disk.
+            print(f"  {performed.get('reason')}")
+
+            current = state.record_action(current, action_name)
+
+        elif args.arm:
+            print("  the action failed; see the audit log.")
 
         else:
             # No state is written on an unarmed decision to act, so the
@@ -730,10 +1466,27 @@ def run_once(args) -> int:
             # Even a failed action moves to VERIFYING: the request may
             # have been accepted before the error, and re-issuing it on
             # the next tick is the behaviour to avoid.
-            current = state.transition(current, state.VERIFYING)
+            #
+            # `run_ref` is carried across here because ACTING and
+            # VERIFYING both poll it, and a launch whose reference was
+            # not persisted is indistinguishable from one that never
+            # happened.
+            current = state.transition(
+                current,
+                state.VERIFYING,
+                run_ref=performed.get("run_ref"),
+                credential_source=(
+                    performed.get("credential_source")
+                    or current.get("credential_source")
+                ),
+            )
 
     elif decision["to_state"]:
-        fields = {}
+        # Fields the decision asked to be persisted alongside the
+        # transition — the verify verdict, the observed version, the run
+        # status. Applied generically rather than key by key so a new
+        # verdict field does not need a matching branch here.
+        fields = dict(decision.get("fields") or {})
 
         if decision.get("reset_breaches"):
             fields["consecutive_breaches"] = 0
@@ -746,9 +1499,22 @@ def run_once(args) -> int:
 
             print(f"transition:       -> {decision['to_state']}")
 
-    elif "consecutive_breaches" in decision:
-        current["consecutive_breaches"] = decision["consecutive_breaches"]
-        state.write(current)
+            if fields.get("verify_verdict"):
+                print(f"verify verdict:   {fields['verify_verdict']}")
+
+    else:
+        # No transition, but a decision may still have observations worth
+        # persisting — the run status it just polled, for instance, so an
+        # operator reading --status sees it without waiting for a state
+        # change.
+        fields = dict(decision.get("fields") or {})
+
+        if "consecutive_breaches" in decision:
+            fields["consecutive_breaches"] = decision["consecutive_breaches"]
+
+        if fields:
+            current.update(fields)
+            state.write(current)
 
     record = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -795,10 +1561,14 @@ def main() -> int:
 
     parser.add_argument(
         "--action",
-        choices=df_api.ACTIONS,
+        choices=df_api.ACTIONS + (trigger.ACTION,),
         help=(
-            "Force a specific remediation instead of the alternating "
-            "selection. Does not bypass the state machine or the guardrail."
+            "Force a specific remediation instead of the one "
+            f"SELFHEAL_ACTION_MODE selects (currently {config.ACTION_MODE!r}). "
+            f"{trigger.ACTION} hands the incident to the Agent Studio "
+            "workflow; the other two are the original direct actions, neither "
+            "of which repairs anything. Does not bypass the state machine or "
+            "the guardrail."
         ),
     )
 
@@ -827,6 +1597,17 @@ def main() -> int:
         ),
     )
 
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help=(
+            "Re-read the live deployment and rewrite the CRNs and flow "
+            "version recorded in the state file. Changes nothing in CDF. Use "
+            "after provisioning out of band, or when --status shows a null "
+            "deployment_crn, which refuses every action."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Cloudera AI runtimes do not ship cdpcli; setup_runtime.py installs
@@ -843,6 +1624,9 @@ def main() -> int:
         print("self-test:")
 
         return 0 if df_api.selftest() else 1
+
+    if args.reconcile:
+        return reconcile()
 
     if args.reset:
         current = state.read()
