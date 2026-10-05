@@ -7,18 +7,24 @@ remediate — Apache NiFi data flows running as deployments in **Cloudera DataFl
 
 Each example is an exported Agent Studio workflow template (a `.zip` under
 [`templates/`](templates/)) that you import into your own Agent Studio project, point
-at your own CDP environment, and run. All of them are read-only so far, and all of them
-need the same single credential: a CDP API access key pair.
+at your own CDP environment, and run. All of them need the same single credential: a CDP
+API access key pair.
 
-If you only want the one that works and gives the most detail, it is
-[example 3](#3-nifi-flow-metrics-monitoring-agents).
+Examples 1–3 are read-only. **Example 4 can change a flow** — it edits the deployed flow
+definition and swaps the running deployment onto the result — so it is gated differently
+from the rest and worth reading about before you import it.
 
-One thing here is not an Agent Studio template and not read-only:
-[`self_healing/`](self_healing/) is a prototype that actually *acts* on a deployment —
-a plain Cloudera AI cron job, no agent and no LLM, built to prove the
-`monitor → detect → decide → act → audit` lifecycle on its own before an agent is asked
-to drive it. Its most useful result is a negative one, and the
-[Roadmap](#roadmap) explains why that result should shape the agentic version.
+If you only want the one that works and gives the most detail without touching anything,
+it is [example 3](#3-nifi-flow-metrics-monitoring-agents).
+
+One thing here is not an Agent Studio template at all:
+[`self_healing/`](self_healing/) is a prototype that acts on a deployment without any
+agent or LLM — a plain Cloudera AI cron job, built to prove the
+`monitor → detect → decide → act → audit` lifecycle on its own before an agent was asked
+to drive it. Its most useful result is a negative one: neither action available to it
+actually repaired anything, and the restart it chose left the queue *higher* than it
+found it. That measurement is why example 4 exists and what shaped its design, so the
+[Roadmap](#roadmap) is worth reading alongside it.
 
 ---
 
@@ -56,31 +62,51 @@ If you know one half of this stack but not the other:
 | **Deployment CRN** | The Cloudera Resource Name identifying one CDF deployment, e.g. `crn:cdp:df:us-west-1:...`. The primary input to every example here. |
 | **CDP CLI (`cdpcli`)** | Cloudera's control-plane CLI, pip-installable and importable as a Python module. The tools here drive the Cloudera API through it. |
 
-### Three places to ask "is this flow healthy"
+### Four places to ask "is this flow healthy"
 
-| | **Deployment status** | **Deployment metrics** | **NiFi canvas** |
-| --- | --- | --- | --- |
-| API | Cloudera DataFlow (CDP) | Cloudera DataFlow (CDP) | NiFi REST API (`/nifi-api`) |
-| Answers | Is the *deployment* up? | What are the *numbers* inside it? | What is the *state* of each component? |
-| Sees | Status, sizing, NiFi version, configured KPIs | Measured metric charts with current vs. average values, KPI thresholds, alerts, event history | Processor run states, validity, queue depths, bulletins |
-| Auth | CDP API access key pair | CDP API access key pair | **No credential works** — see [below](#why-the-nifi-rest-api-is-not-reachable) |
-| Example | [1. NiFi Monitoring Agents](#1-nifi-monitoring-agents) | [3. NiFi Flow Metrics Monitoring Agents](#3-nifi-flow-metrics-monitoring-agents) | [2. NiFi Canvas Monitoring Agents](#2-nifi-canvas-monitoring-agents) — blocked |
+| | **Deployment status** | **Deployment metrics** | **NiFi canvas** | **Flow definition** |
+| --- | --- | --- | --- | --- |
+| API | Cloudera DataFlow (CDP) | Cloudera DataFlow (CDP) | NiFi REST API (`/nifi-api`) | Cloudera DataFlow (CDP) |
+| Answers | Is the *deployment* up? | What are the *numbers* inside it? | What is the *state* of each component? | How is each component *configured*? |
+| Sees | Status, sizing, NiFi version, configured KPIs | Measured metric charts with current vs. average values, KPI thresholds, alerts, event history | Processor run states, validity, queue depths, bulletins | Every processor's scheduling, concurrency and properties; every connection's endpoints and back-pressure thresholds |
+| Writable? | no | no | yes, but a canvas edit reverts on the next redeploy | **yes, and durably** — edit the JSON, import a version, swap the deployment onto it |
+| Auth | CDP API access key pair | CDP API access key pair | **No credential works** — see [below](#why-the-nifi-rest-api-is-not-reachable) | CDP API access key pair |
+| Example | [1. NiFi Monitoring Agents](#1-nifi-monitoring-agents) | [3. NiFi Flow Metrics Monitoring Agents](#3-nifi-flow-metrics-monitoring-agents) | [2. NiFi Canvas Monitoring Agents](#2-nifi-canvas-monitoring-agents) — blocked | [4. NiFi Flow Repair Agents](#4-nifi-flow-repair-agents) |
 
-The distinction matters: **a deployment can be perfectly healthy at the control-plane
-level while the flow inside it is broken**. The control plane says `RUNNING` while
-throughput sits at zero and a queue only grows.
+The first distinction matters because **a deployment can be perfectly healthy at the
+control-plane level while the flow inside it is broken**. The control plane says `RUNNING`
+while throughput sits at zero and a queue only grows.
 
-The first two columns are what this repo can actually reach. The third is the one you
-would reach for first and the one you cannot have: a CDF Public Cloud deployment's NiFi
-REST API rejects every credential CDP can mint, for reasons worked out in detail
+The fourth column is the one worth knowing about if you came here looking for the third.
+We spent real time establishing that the canvas is unreachable, and concluded from that
+we could not get processor-level granularity — the whole of example 2 is that dead end.
+That conclusion was wrong, and the mistake is worth naming because it is easy to repeat:
+**the canvas is not the only per-component view.** `cdp df get-flow-version` returns the
+flow *definition*, which names every processor and every one of its settings. It answers a
+different question — configured intent rather than live runtime state — but for anything
+you would want to *change*, intent is the better question anyway, and it is the only one
+with a durable write path. A canvas edit in CDF reverts on the next redeploy; a version
+swap does not.
+
+So the two columns are complements rather than substitutes. Metrics tell you a queue is
+backing up; the definition tells you the draining processor is set to two concurrent
+tasks. Neither alone gets you to a repair.
+
+Three of the four columns are reachable with one CDP API key pair. The canvas is the one
+you would reach for first and the one you cannot have: a CDF Public Cloud deployment's
+NiFi REST API rejects every credential CDP can mint, for reasons worked out in detail
 [further down](#why-the-nifi-rest-api-is-not-reachable).
 
-So the middle column is the substitute, and it is worth being precise about how good a
-substitute it is. It gives **measured values over a time window**, which is what makes
-"is this normal?" answerable at all — a number is only alarming next to its own average.
-What it does **not** give is per-component detail by default. See
+The metrics column is the substitute for *observing*, and it is worth being precise about
+how good a substitute it is. It gives **measured values over a time window**, which is
+what makes "is this normal?" answerable at all — a number is only alarming next to its own
+average. What it does **not** give is per-component detail by default. See
 [how much component detail you actually get](#how-much-component-detail-you-actually-get)
 before planning around it.
+
+The flow-definition column is the substitute for *changing*, and it has no such caveat:
+it is always per-component, because a flow definition cannot describe a processor without
+naming it.
 
 ---
 
@@ -121,11 +147,22 @@ A few design choices are deliberate and worth copying into future examples:
 - **The tool returns the raw Cloudera API JSON, unwrapped.** No
   `{"success": true, "response": ...}` envelope — the agent sees every field CDF
   returned, so the same tool supports questions you didn't anticipate when you wrote it.
-  There is exactly one documented exception, where a response would otherwise be mostly
-  time-series points: [chart compaction](#chart-compaction) in example 3.
+  There are two documented exceptions, and they are exceptions for opposite reasons:
+  [chart compaction](#chart-compaction) in example 3, where the response would otherwise
+  be mostly time-series points, and example 4's `getDeployedFlow`, which **withholds the
+  flow definition on purpose**. A model that can see flow JSON can be coaxed into
+  authoring flow JSON, so it is shown a named inventory instead, with an explicit
+  `notes.flow_definition_withheld` saying the omission was deliberate rather than a
+  failure.
 - **Failures return structured data, not exceptions.** Every error path returns a dict
   containing `error` and the `deployment_crn`, so the agent can report "the API call
   failed, here's why" instead of guessing around a blank response.
+- **A tool that writes defaults to not writing.** Example 4's `applyFlowRepair` takes
+  `arm: bool = False` and, unarmed, returns the exact commands it would have run. The
+  flag is a *tool* parameter the agent cannot set on its own initiative without the
+  incident telling it to, and the deployment-name prefix that scopes what may be touched
+  is a module constant rather than a parameter — a parameter could be set to `""`, and
+  then every deployment in the tenant would pass the check.
 
 ---
 
@@ -141,7 +178,11 @@ Every example needs the same single credential: a **CDP API access key pair**
 deployments. Nothing here needs a second one.
 
 The identity also needs a DataFlow role granting access to the deployment:
-`DFFlowUser` for read-only, `DFFlowAdmin` for full privileges.
+`DFFlowUser` for read-only, `DFFlowAdmin` for full privileges. Examples 1–3 need only
+the former. **Example 4 writes — a catalog version import and a deployment flow-version
+swap — so it needs `DFFlowAdmin`.** Read access proves nothing about whether the swap
+will be permitted, which is a distinction worth knowing in advance because the failure
+arrives at the mutation, after the agent has already produced a proposal.
 
 > **No workload password is involved.** If you have set one, it is not used here, and it
 > will not authenticate against `/nifi-api` — NiFi behind the DFX gateway has no
@@ -154,7 +195,9 @@ The identity also needs a DataFlow role granting access to the deployment:
 1. **Import the template.** In Agent Studio, import a workflow template and upload the
    `.zip` from [`templates/`](templates/) — `workflow_template_e49veqyy.zip` for
    example 3, which is the one to start with. Agent Studio recreates the workflow,
-   agent, task, and tool, and builds the tool's virtualenv from its `requirements.txt`.
+   agent, task, and tool, and builds each tool's virtualenv from its `requirements.txt`.
+   `cdpcli` is large, so expect a few minutes; example 4 declares three tools and so
+   builds three virtualenvs.
 
 2. **Supply credentials to the tool.** Every tool here declares the same two
    user-configurable parameters. Set them in the tool's configuration:
@@ -165,10 +208,24 @@ The identity also needs a DataFlow role granting access to the deployment:
    | `CDP_PRIVATE_KEY` | Your CDP private key |
 
    These are *tool* parameters, not agent inputs — the LLM never sees or supplies them.
+   Set them on **each** tool: example 4 has three, and a tool with no credentials fails
+   at its first call rather than at import.
 
-3. **Run the workflow.** Paste the CRN of the deployment you want inspected into
+3. **Assign an LLM to the agent.** The [Prerequisites](#prerequisites) call for a model
+   registered in the workspace, but registering it does not attach it to an imported
+   agent — that is a separate selection on the agent itself, and an unassigned agent
+   fails at run time rather than at import.
+
+4. **Run the workflow.** Paste the CRN of the deployment you want inspected into
    `deployment_crn`. Example 3 takes a second input, `metrics_time_period` — start with
    `LAST_ONE_HOUR`. You should get back a report grounded in the live API response.
+
+   **Example 4 takes six inputs**, because it is written to be launched by the monitoring
+   job rather than filled in by hand: `incident_id`, `deployment_crn`, `queue_depth`,
+   `drain_rate`, `breach_count` and `observed_at`. To run it manually, copy them from an
+   incident record in the job's audit log — that is the intended human-gated path, not a
+   workaround. Expect a report ending in `PROPOSED`; nothing is changed unless you both
+   set `arm: true` and say in the incident text that a human armed it.
 
 ### Testing a tool on its own
 
@@ -241,6 +298,7 @@ doesn't, the problem is in the workflow wiring, not in the Cloudera API call.
 │   ├── workflow_template_13nuodia.zip      # importable: NiFi Monitoring Agents
 │   ├── workflow_template_gvie9za2.zip      # importable: NiFi Canvas Monitoring Agents
 │   ├── workflow_template_e49veqyy.zip      # importable: NiFi Flow Metrics Monitoring Agents
+│   ├── workflow_template_k3rhzv7m.zip      # importable: NiFi Flow Repair Agents (mutates)
 │   └── src/                                # unpacked sources, for review and rebuilds
 │       ├── build_template.py               # packs a source dir into an importable .zip
 │       ├── run_tool_local.py               # runs one template's tool outside Agent Studio
@@ -254,15 +312,25 @@ doesn't, the problem is in the workflow wiring, not in the Cloudera API call.
 │       │   └── studio-data/tool_templates/pollnificanvas_ZG6cbJh4/
 │       │       ├── tool.py
 │       │       └── requirements.txt
-│       └── nifi_flow_metrics_monitoring/
+│       ├── nifi_flow_metrics_monitoring/
+│       │   ├── workflow_template.json
+│       │   └── studio-data/tool_templates/polldeploymentmetrics_PddIfQLk/
+│       │       ├── tool.py
+│       │       └── requirements.txt
+│       ├── vendor_repairs.py               # copies repairs.py into the repair tools
+│       └── nifi_flow_repair/
 │           ├── workflow_template.json
-│           └── studio-data/tool_templates/polldeploymentmetrics_PddIfQLk/
-│               ├── tool.py
-│               └── requirements.txt
+│           ├── guardrail_walk.py           # runs every refusal against a stubbed CDP CLI
+│           └── studio-data/tool_templates/
+│               ├── getdeployedflow_3mFBJGxl/{tool.py,requirements.txt}
+│               ├── proposeflowrepair_On1fGSOC/{tool.py,requirements.txt}
+│               └── applyflowrepair_1imeQOp7/{tool.py,requirements.txt}
 └── self_healing/                           # NOT Agent Studio: the one thing that acts
     ├── README.md                           # the prototype's own writeup — read this first
     ├── config.py                           # every tunable, each overridable by env var
     ├── df_api.py                           # CDP CLI wrapper + the guardrail + metric merge
+    ├── repairs.py                          # the repair whitelist + validate_edit(); vendored
+    ├── trigger.py                          # launches the repair workflow; backend pluggable
     ├── state.py                            # locked, atomic state file
     ├── flow/
     │   ├── build_flow_definition.py        # emits the synthetic misbehaving flow
@@ -278,8 +346,19 @@ doesn't, the problem is in the workflow wiring, not in the Cloudera API call.
         └── create_job.py                   # registers the job + schedule via cmlapi
 ```
 
-`templates/` and `self_healing/` share no code in either direction, on
-purpose — nothing in one imports from the other.
+`templates/` and `self_healing/` **import** nothing from each other, in either direction, on
+purpose: Agent Studio loads a tool as a single file, so a tool that imported from this repo
+would work locally and fail the moment it was imported into Agent Studio.
+
+One piece of code is nevertheless *shared*, and the distinction matters if you are editing it.
+[`self_healing/repairs.py`](self_healing/repairs.py) — the repair whitelist and
+`validate_edit()` — is **copied** into all three tools of example 4 by
+[`templates/src/vendor_repairs.py`](templates/src/vendor_repairs.py), between sentinel comments
+in both files. The copy is generated rather than hand-maintained because the two would
+otherwise drift in the worst available way: both sides would keep passing their own tests
+while disagreeing about what a repair means, and one of them decides what the agent is shown
+while the other decides what gets written into a permanent catalog version. Edit the source,
+then run `python templates/src/vendor_repairs.py` and rebuild the zip.
 
 Each template `.zip` has the Agent Studio export structure:
 
@@ -324,6 +403,7 @@ time.
 | [`workflow_template_13nuodia.zip`](templates/workflow_template_13nuodia.zip) | **NiFi Monitoring Agents** | Read-only inspection of a CDF deployment's live status via the Cloudera DataFlow API |
 | [`workflow_template_gvie9za2.zip`](templates/workflow_template_gvie9za2.zip) | **NiFi Canvas Monitoring Agents** | Read-only inspection of the NiFi canvas itself — component states, queues, throughput, bulletins — via the NiFi REST API. **Blocked on CDF Public Cloud** ([why](#why-the-nifi-rest-api-is-not-reachable)) |
 | [`workflow_template_e49veqyy.zip`](templates/workflow_template_e49veqyy.zip) | **NiFi Flow Metrics Monitoring Agents** | Read-only per-component flow metrics — processor and connection charts, KPI thresholds, active alerts, event history — via the DataFlow API. **Start here** |
+| [`workflow_template_k3rhzv7m.zip`](templates/workflow_template_k3rhzv7m.zip) | **NiFi Flow Repair Agents** | The first example that can *change* a flow. Reads the deployed flow definition at processor level, proposes one repair from a fixed whitelist, and applies it by catalog version swap — mutation gated on `arm: true` and six refusals. See [4](#4-nifi-flow-repair-agents) |
 
 ### 1. NiFi Monitoring Agents
 
@@ -867,6 +947,153 @@ than enforced with a pydantic `Literal`, because a `Literal` raises a `Validatio
 text the agent never sees — it would just fail. This way the agent is told what it sent, what
 is accepted, and can retry.
 
+### 4. NiFi Flow Repair Agents
+
+The first example here that can change anything. Examples 1–3 read; this one edits a flow
+definition and swaps the running deployment onto the result.
+
+It exists because the self-healing prototype in [`self_healing/`](self_healing/) proved its
+own two remediations were not repairs: a measured `restart-deployment` went in with the
+queue at 428 files and the queue read **883** three minutes later, because restarting stops
+the draining processor along with the generator and the backlog simply freezes at breach
+level. Fixing that needs processor-level granularity, which we assumed meant the NiFi REST
+API — and that is [not reachable](#why-the-nifi-rest-api-is-not-reachable). The assumption
+was wrong: `cdp df get-flow-version` returns the flow definition JSON, editing one
+processor field in it is as granular as a canvas change and more durable, and
+`cdp df change-flow-version-in-deployment` swaps the running flow onto a new version in
+place. So the repair is a one-field edit through a fully supported API, with the same
+credential examples 1 and 3 already use.
+
+```
+  ┌─ Cloudera AI job, cron * * * * * ───────────────────┐
+  │  monitor → detect → debounce → guardrail           │   runs forever
+  │  measures the queue depth and the drain rate       │   owns every clock
+  └────────────────────────┬───────────────────────────┘
+                           │ six scalars, no flow JSON:
+                           │ incident_id, deployment_crn, queue_depth,
+                           │ drain_rate, breach_count, observed_at
+                           ▼
+  ┌─ Agent Studio workflow, launched once per incident ─┐
+  │                                                     │
+  │   getDeployedFlow ──────▶ version + named inventory │  read
+  │          │                (definition withheld)     │
+  │          ▼                                          │
+  │   proposeFlowRepair ────▶ field-level before/after   │  read
+  │          │                + apply_echo              │
+  │          ▼                                          │
+  │   applyFlowRepair ──────▶ 6 refusals, then          │  WRITE
+  │                           import version → swap     │  arm: false
+  └────────────────────────┬───────────────────────────┘
+                           │ an incident report; prose, not an outcome
+                           ▼
+  ┌─ the same job, later ───────────────────────────────┐
+  │  re-reads the KPI and decides whether it worked     │
+  │  the agent's claim is never the evidence            │
+  └─────────────────────────────────────────────────────┘
+```
+
+**Three tools, because the agent must be able to propose without being able to act.**
+
+| Tool | Mutates | Does |
+| --- | --- | --- |
+| `getDeployedFlow` | no | the deployed flow version plus a named per-processor and per-connection inventory |
+| `proposeFlowRepair` | no | applies a named repair in memory and returns a field-level before/after diff |
+| `applyFlowRepair` | **yes**, gated | re-derives the same edit, imports a catalog version, swaps the deployment, re-reads |
+
+**The agent never sees flow JSON, and there is no path by which it could submit any.** It
+names a repair from a fixed whitelist — `speed_up_slow_drain` (bounded `1 ≤ N ≤ 8`) or
+`restore_baseline` — and supplies one integer. The tools own the transformation. This is not
+a courtesy restriction; it is the reason a model is allowed near a production flow at all,
+and it is why `getDeployedFlow` returns an inventory with an explicit
+`notes.flow_definition_withheld` rather than the definition itself.
+
+The upper bound of 8 is not arbitrary and must not be raised. A drain is only measurable if
+it takes longer than one metric bucket; at 600 files and a 75-second bucket that ceiling is
+exactly 8 files per second, which is `concurrentlySchedulableTaskCount: 8`. Beyond it the
+repair would heal the queue in a way this monitor cannot see.
+
+#### What stops a wrong CRN
+
+`applyFlowRepair` refuses six times before it mutates anything. On a shared tenant a CRN is a
+hundred characters of hex in which one wrong digit names someone else's production system, so
+these are the load-bearing part of the example:
+
+| Refusal | Why it is separate from the others |
+| --- | --- |
+| the repair is on the whitelist | an invented name is reported with `allowed_values`, never approximated |
+| the deployment's live name starts with `pdf-selfheal` | a module constant, deliberately **not** a tool parameter: a parameter could be set to `""` and every deployment in the tenant would pass |
+| the catalog flow appears in a prefix-scoped listing, **and** its name is re-checked | `--search-term` is a server-side substring match, so `not-pdf-selfheal-oscillator` matches it; this gates a write |
+| the deployed `flowVersion` equals the one the proposal was computed from | a stale proposal replayed against a flow that has since changed |
+| the caller's echoed `expected_values` match the edit re-computed here | this is what prevents a proposal being widened between proposing and applying |
+| `validActions` offers neither `RETRY_` nor `CANCEL_CHANGE_FLOW_VERSION` | the API volunteering that a previous swap is half-applied — never retry that automatically |
+
+Then `apply()` runs `validate_edit()` internally, which asserts the edit changed *only* what
+the repair declared: identifiers, group ancestry, bundle versions and connection names all
+unchanged, and no JSON path outside the repair's allow-list differs. Allow-list, not
+deny-list, for the same reason the log redaction here is: a deny-list passes through whatever
+it failed to anticipate. Renaming a connection is in that list because a `MetricChart` carries
+`componentName` and no component id, so a rename silently orphans the KPI — which is to say,
+blinds the monitor.
+
+`arm` defaults to `false` and the dry run returns the exact two `argv` lines it would have
+executed. Two flags on the swap are chosen rather than defaulted:
+
+**`--strategy ONLY_RESTART_AFFECTED_COMPONENTS`.** `STOP_AND_EMPTY_QUEUES` is the only call in
+the whole DataFlow surface that genuinely drains a backlog, which makes it the tempting
+choice — it is exactly what `restart-deployment` could not do. It would also make the proof
+worthless, because it empties the queue as a *side effect*: the monitored metric improves
+whether or not the repair did anything. This repo has already been burned once by an action
+whose effect on the signal was not what it looked like, and the fix is not to pick an action
+that flatters the signal. Restarting only the changed processor leaves the existing backlog
+in place, so a faster drain can be watched actually draining it.
+
+**No `--kpis`.** The flag's own documentation says that if KPIs are specified they *replace*
+all existing ones, so omitting it preserves them. A swap that dropped the connection KPI would
+leave the monitor reporting health while unable to see the queue at all — which is why
+`chart_present_before` is compared against the live chart afterwards, and why that mismatch
+escalates instead of cooling. ([`self_healing/README.md`](self_healing/README.md) records the
+same whole-array hazard on `update-deployment --kpis`, which is used nowhere in this repo.)
+
+#### It is launched, not scheduled
+
+An Agent Studio workflow runs **once** and makes one pass. It cannot sit in a loop polling an
+API, so detection cannot live inside it. The split is that a Cloudera AI job monitors
+continuously and launches this workflow once per incident, handing it six scalars —
+`incident_id`, `deployment_crn`, `queue_depth`, `drain_rate`, `breach_count`, `observed_at` —
+as task placeholders. Everything else the agent reads through its own tools. Those
+placeholders are *prompt text*, which is the other reason the flow definition is not passed
+in: it would mean pasting 6KB of JSON into the model's context.
+
+The agent is told to report the drain rate it predicts **and to say plainly that it has not
+measured it**. The job measures the real rate afterwards from the KPI, and only that
+measurement decides whether the repair worked. The reason is in the agent's own backstory: a
+faster drain means the queue spends less time above its threshold, so a successful repair
+makes the breach count a *worse* signal, not a better one. The acceptance criterion is the
+slope, never the absence of a breach — and that is why `restore_baseline` is in the whitelist
+rather than being a nicety.
+
+#### Editing it
+
+The repair whitelist and `validate_edit()` live in
+[`self_healing/repairs.py`](self_healing/repairs.py) and are **copied** into all three tools,
+because Agent Studio imports a tool as a single file and so a tool cannot import anything
+from this repo. The copy is generated, not hand-maintained:
+
+```bash
+python templates/src/vendor_repairs.py --check     # verify; exit 1 on drift
+python templates/src/vendor_repairs.py             # regenerate
+python templates/src/nifi_flow_repair/guardrail_walk.py
+```
+
+Run all three before rebuilding the zip. The last one is not redundant: the first generated
+tools shipped with a missing `import copy`, which no static check caught — they imported
+cleanly, exposed the right contract, and answered three guardrail cases correctly before
+failing inside `apply()`. The vendoring script now refuses to generate a tool whose import
+block lacks what the copied region uses, and `guardrail_walk.py` executes every refusal
+against a stubbed CDP CLI, so the whole gate runs with no credentials and no VPC — which
+matters, because there is **no `deleteFlowVersion` operation** and every live test of the
+apply path leaves a permanent catalog version behind.
+
 ---
 
 ## Credentials and safety
@@ -876,25 +1103,50 @@ is accepted, and can retry.
   `UserParameters`, never in `ToolParameters`.
 - **Never commit keys.** No credentials belong in this repo, in a template `.zip`, or in
   a `tool.py`. Configure them in Agent Studio at import time.
-- **Prefer a dedicated machine user** scoped to the DataFlow read permissions the tool
-  actually needs, rather than a human user's personal keys.
-- **Every Agent Studio example here is read-only** by design. The one component with
-  write access is [`self_healing/`](self_healing/), which is not an agent and not
-  importable — and it treats that access as its own problem rather than a configuration
-  detail. Acting requires an explicit `--arm`; every mutating call passes a guardrail
-  that checks a denylist of pre-existing deployments, requires the CRN recorded at
-  provisioning, and re-reads the target's name live to confirm the prototype's own
-  prefix. Worth reading before you give any agent a write path, because the cost of
-  getting it wrong is restarting a colleague's production flow.
+- **Prefer a dedicated machine user** scoped to the DataFlow permissions the tool
+  actually needs, rather than a human user's personal keys. Examples 1–3 need only read
+  permissions; give them only read permissions.
+- **Two things here have write access, and they are different kinds of risk.**
+  [`self_healing/`](self_healing/) is not an agent and not importable: no LLM chooses
+  anything in it. [Example 4](#4-nifi-flow-repair-agents) *is* an agent with a write path,
+  which is a different risk profile and is gated accordingly.
+
+  Both share the same guardrail shape, and it is worth reading before you give any agent
+  a write path of your own, because the cost of getting it wrong is breaking a colleague's
+  production flow. Acting requires an explicit arming step. Every mutating call checks a
+  denylist of pre-existing deployments, requires the CRN recorded at provisioning, and
+  re-reads the target's name *live* to confirm the prefix — the live re-read matters
+  because a recorded CRN proves only what was true when it was recorded.
+- **Scope a write by something the model cannot widen.** Example 4's deployment-name
+  prefix and its repair whitelist are module constants, not tool parameters. The agent
+  selects from the whitelist; it cannot extend it, and it cannot relax the prefix to `""`.
+- **Don't show a model the document you don't want it to write.** Example 4's agent is
+  never given the flow definition, only a named inventory of it. The withholding is the
+  mechanism, not the prompt: there is no parameter on any of its three tools that accepts
+  flow JSON, so "never author a flow definition" is enforced by the absence of a path
+  rather than by an instruction the model might reinterpret.
+- **Know what a mutation leaves behind.** There is no `deleteFlowVersion` operation in the
+  DataFlow API, so every applied repair leaves a permanent catalog version and
+  `delete-flow` is all-or-nothing. That is why example 4's guardrails are exercised
+  against a stubbed CLI rather than live, and why its dry run is the default rather than
+  a flag you remember to pass.
 
 ---
 
 ## Roadmap
 
-> **Mostly planned, not yet implemented.** Every *Agent Studio example* above is
-> read-only. The one exception to the whole list is the last bullet, self-healing, which
-> now has a working prototype in [`self_healing/`](self_healing/) — though not as an
-> agent, and not as repair. See that bullet for what it does and does not prove.
+> **Mostly planned, not yet implemented.** Examples 1–3 are read-only. Example 4 is the
+> first that can write, and the last bullet below — self-healing — is where it comes from:
+> there is a working non-agentic prototype in [`self_healing/`](self_healing/) whose
+> measured failure to *repair* anything is the reason example 4 exists.
+>
+> Be precise about what example 4 has and has not shown. Its three tools are built, its
+> six refusals are each exercised against a stubbed CDP CLI, and its dry run emits the
+> exact commands it would issue. **The armed apply has not yet been run against the live
+> deployment**, so the claim "a whitelisted edit swapped onto a running flow makes the
+> queue drain measurably faster" is designed for and not yet earned. The number that will
+> settle it is the drain rate: −1.99 files/s at concurrency 2, measured across nine
+> buckets with no scatter, against an expected ≈ −4.0 at concurrency 4.
 
 - **Comparing the layers, not just reading them.** Example 1 reports what the control
   plane thinks of a deployment and example 3 reports what its components actually measured,
@@ -946,6 +1198,22 @@ is accepted, and can retry.
   which API an agent may touch — they are about refusing to re-act on a signal the
   previous action is expected to have made worse.
 
+  **Example 4 is the answer to that measurement**, and it took the opposite route from the
+  one we expected. Repairing a flow needs processor-level control, which we assumed meant
+  the NiFi REST API — and that is unreachable here. It does not: the DataFlow API returns
+  the flow definition as JSON, and swapping the deployment onto an edited version of it is
+  both processor-granular and durable in a way a canvas edit is not. So the repair is a
+  one-field edit through the same control-plane API example 1 already uses, with the agent
+  choosing a repair *name* and one bounded integer and never seeing the JSON at all.
+
+  What remains genuinely open is the loop's closure, not the repair. An Agent Studio
+  workflow runs once and cannot poll, so the monitoring job has to *launch* it — and
+  whether Agent Studio offers any programmatic launch is still unverified. Until that is
+  settled, `TRIGGER_BACKEND` defaults to `record_only`: the job detects, writes a complete
+  incident payload to the audit log, and launches nothing. That is the honest fallback
+  rather than a stub — a human opens the workflow with the recorded payload — and it is
+  what makes the whole loop demoable with no Agent Studio dependency at all.
+
 ---
 
 ## Adding a new example
@@ -983,3 +1251,26 @@ Conventions the existing templates follow, worth keeping:
   and `--tool-params` as JSON so the tool can be tested standalone.
 - Return real API responses unwrapped; return errors as structured dicts rather than
   raising.
+- Validate an enumerated parameter inside `run_tool` and return `allowed_values` on a
+  miss, rather than typing it as a pydantic `Literal`. A `Literal` raises a
+  `ValidationError` whose text the agent never sees, so the call just fails; this way the
+  agent is told what it sent and what is accepted, and can retry.
+
+If the new example **writes** anything, four more apply. Example 4 is the worked case:
+
+- **Separate the reading tool from the writing tool**, so the agent can propose without
+  being able to act, and make the writing one default to a dry run that returns the exact
+  commands it would have issued.
+- **Scope what may be touched with a module constant, not a tool parameter.** Anything the
+  agent can set, it can set to something permissive.
+- **Make the agent name an operation, never author its payload.** A whitelist of repair
+  names plus one bounded integer is a surface you can reason about; a JSON document the
+  model wrote is not.
+- **Require the writer to echo back what the proposer produced**, and re-derive the change
+  independently before comparing. This is what stops a proposal being widened between
+  being shown to a human and being applied.
+
+And if a tool has to share logic with code elsewhere in this repo, generate the copy
+rather than writing it twice — see
+[`templates/src/vendor_repairs.py`](templates/src/vendor_repairs.py) and the note on
+[what `templates/` and `self_healing/` share](#repository-layout).
